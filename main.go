@@ -162,11 +162,11 @@ type controller struct {
 }
 
 func dumpTokens(w io.Writer, tokens tokens) {
-	_, _ = fmt.Fprintf(w, "export AWS_DEFAULT_REGION = %q\n", tokens.Region)
-	_, _ = fmt.Fprintf(w, "export AWS_ACCESS_KEY_ID = %q\n", tokens.AccessKeyID)
-	_, _ = fmt.Fprintf(w, "export AWS_SECRET_ACCESS_KEY = %q\n", tokens.SecretAccessKey)
-	_, _ = fmt.Fprintf(w, "export AWS_SESSION_TOKEN = %q\n", tokens.SessionToken)
-	_, _ = fmt.Fprintf(w, "export AWS_SESSION_EXPIRATION = %q\n", tokens.Expiration.In(time.Local))
+	_, _ = fmt.Fprintf(w, "export AWS_DEFAULT_REGION=%q\n", tokens.Region)
+	_, _ = fmt.Fprintf(w, "export AWS_ACCESS_KEY_ID=%q\n", tokens.AccessKeyID)
+	_, _ = fmt.Fprintf(w, "export AWS_SECRET_ACCESS_KEY=%q\n", tokens.SecretAccessKey)
+	_, _ = fmt.Fprintf(w, "export AWS_SESSION_TOKEN=%q\n", tokens.SessionToken)
+	_, _ = fmt.Fprintf(w, "export AWS_SESSION_EXPIRATION=%q\n", tokens.Expiration.In(time.Local))
 }
 
 // Common errors.
@@ -411,13 +411,16 @@ begin:
 	e1 := resp.Body.Close()
 	_ = e1 // Best effort.
 	if resp.StatusCode == http.StatusInternalServerError && string(buf) == ErrMissingMFA.Error() {
-		fmt.Printf("Enter MFA code: ")
+		fmt.Fprintf(os.Stderr, "Enter MFA code: ")
 		if _, err := fmt.Scanf("%s", &mfa); err != nil {
 			log.Fatalf("Read mfa: %s", err)
 		}
 		goto begin
 	}
 	fmt.Printf("%s", buf)
+	if resp.StatusCode != http.StatusOK {
+		os.Exit(1)
+	}
 }
 
 var debugMode bool
