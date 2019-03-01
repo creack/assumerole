@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/user"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/fsnotify/fsnotify"
 	"github.com/go-ini/ini"
 	"github.com/pkg/errors"
 )
@@ -59,22 +62,15 @@ func (c configEntry) merge(c1 configEntry) configEntry {
 	return c
 }
 
+func defaultConfigPaths() (configFilePath, credsFilePath string, err error) {
+	u, err := user.Current() // Lookup current user to get HomeDir.
+	if err != nil {
+		return "", "", errors.Wrap(err, "user.Current")
+	}
+	return u.HomeDir + "/.aws/config", u.HomeDir + "/.aws/credentials", nil
+}
+
 func loadAWSConfigFile(configPath, credentialsPath string) (config, credentials *ini.File, err error) {
-	// If path is empty, use the default ~/.aws/config and ~/.aws/credentials.
-	var homeDir string
-	if configPath == "" || credentialsPath == "" {
-		u, err := user.Current() // Lookup current user to get HomeDir.
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "user.Current")
-		}
-		homeDir = u.HomeDir
-	}
-	if configPath == "" {
-		configPath = homeDir + "/.aws/config"
-	}
-	if credentialsPath == "" {
-		credentialsPath = homeDir + "/.aws/credentials"
-	}
 	// Load the ini files.
 	config, err = ini.Load(configPath)
 	if err != nil {
@@ -89,11 +85,15 @@ func loadAWSConfigFile(configPath, credentialsPath string) (config, credentials 
 }
 
 func newIniConfigEntry(section *ini.Section) configEntry {
+	roleARN := section.Key("role_arn").String()
+	if roleARN == "" {
+		roleARN = section.Key("_role_arn").String()
+	}
 	return configEntry{
 		Name:            section.Name(),
 		Region:          section.Key("region").String(),
 		MFASerial:       section.Key("mfa_serial").String(),
-		RoleARN:         section.Key("role_arn").String(),
+		RoleARN:         roleARN,
 		AccessKeyID:     section.Key("aws_access_key_id").String(),
 		SecretAccessKey: section.Key("aws_secret_access_key").String(),
 		SourceProfile:   section.Key("source_profile").String(),
@@ -105,15 +105,8 @@ type configRegistry map[string]configEntry
 func processAWSConfig(configFile, credentialsFile *ini.File) configRegistry {
 	reg := configRegistry{}
 
-	// Load the default config section.
-	defaultEntry := newIniConfigEntry(configFile.Section("default"))
-
 	// Load all the other entries.
 	for _, secName := range configFile.SectionStrings() {
-		// Skip default.
-		if secName == "DEFAULT" || secName == "default" {
-			continue
-		}
 		// Create a config entry from the section.
 		entry := newIniConfigEntry(configFile.Section(secName))
 
@@ -132,7 +125,7 @@ func processAWSConfig(configFile, credentialsFile *ini.File) configRegistry {
 		}
 
 		// Complete the entry with the detault ones.
-		entry = entry.merge(defaultEntry)
+		entry = entry.merge(reg["DEFAULT"])
 
 		secName = strings.TrimPrefix(secName, "profile ") // Remove the "profile " prefixes.
 		entry.Name = secName
@@ -161,12 +154,17 @@ type controller struct {
 	stopChan   chan struct{}
 }
 
-func dumpTokens(w io.Writer, tokens tokens) {
-	_, _ = fmt.Fprintf(w, "export AWS_DEFAULT_REGION=%q\n", tokens.Region)
-	_, _ = fmt.Fprintf(w, "export AWS_ACCESS_KEY_ID=%q\n", tokens.AccessKeyID)
-	_, _ = fmt.Fprintf(w, "export AWS_SECRET_ACCESS_KEY=%q\n", tokens.SecretAccessKey)
-	_, _ = fmt.Fprintf(w, "export AWS_SESSION_TOKEN=%q\n", tokens.SessionToken)
-	_, _ = fmt.Fprintf(w, "export AWS_SESSION_EXPIRATION=%q\n", tokens.Expiration.In(time.Local))
+func dumpTokens(w io.Writer, fmtMode string, tokens tokens) {
+	if fmtMode == "env" {
+		_, _ = fmt.Fprintf(w, "export AWS_DEFAULT_REGION=%q\n", tokens.Region)
+		_, _ = fmt.Fprintf(w, "export AWS_ACCESS_KEY_ID=%q\n", tokens.AccessKeyID)
+		_, _ = fmt.Fprintf(w, "export AWS_SECRET_ACCESS_KEY=%q\n", tokens.SecretAccessKey)
+		_, _ = fmt.Fprintf(w, "export AWS_SESSION_TOKEN=%q\n", tokens.SessionToken)
+		_, _ = fmt.Fprintf(w, "export AWS_SESSION_EXPIRATION=%q\n", tokens.Expiration.In(time.Local))
+		return
+	}
+	buf, _ := json.MarshalIndent(tokens, "", "  ")
+	_, _ = fmt.Fprintf(w, "%s\n", buf)
 }
 
 // Common errors.
@@ -178,29 +176,43 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 	if err := req.ParseForm(); err != nil {
 		return errors.Wrap(err, "ParseForm")
 	}
-	env := req.Form.Get("env")
-	if env == "" {
-		return errors.New("missing 'env' query string")
+	profile := req.Form.Get("profile")
+	if profile == "" {
+		return errors.New("missing 'profile' query string")
+	}
+	fmtMode := req.Form.Get("fmt")
+	if fmtMode == "" {
+		fmtMode = "env"
 	}
 
 	// Check if we have already valid tokens for the requested env.
-	c.RLock()
-	tokens, ok := c.roleTokens[env]
-	c.RUnlock()
+	c.Lock()
+	tokens, ok := c.roleTokens[profile]
+	if ok {
+		tokens.LastUse = time.Now()
+		c.roleTokens[profile] = tokens
+	}
+	c.Unlock()
 	if ok && tokens.Expiration.After(time.Now()) { // Also make sure that the tokens are not expired.
-		dumpTokens(w, tokens)
+		dumpTokens(w, fmtMode, tokens)
 		return nil
 	}
 
 	// If not, get new ones.
-
-	entry, ok := c.configRegistry[env]
+	c.RLock()
+	entry, ok := c.configRegistry[profile]
+	c.RUnlock()
 	if !ok {
 		return errors.New("no configuration found for requested env")
+	}
+	if entry.RoleARN == "" {
+		return errors.New("no role_arn found for requested env")
 	}
 
 	mfa := req.Form.Get("mfa")
 	if entry.MFASerial != "" && mfa == "" {
+		w.Header().Set("X-Role-Arn", entry.RoleARN)
+		w.Header().Set("X-Mfa-Arn", entry.MFASerial)
 		return ErrMissingMFA
 	}
 
@@ -208,16 +220,14 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 		return errors.Wrap(err, "refreshRoleToken")
 	}
 
-	c.RLock()
-	tokens = c.roleTokens[env]
-	c.RUnlock()
+	c.Lock()
+	tokens = c.roleTokens[profile]
+	tokens.LastUse = time.Now()
+	c.roleTokens[profile] = tokens
+	c.Unlock()
 
-	dumpTokens(w, tokens)
+	dumpTokens(w, fmtMode, tokens)
 	return nil
-}
-
-func (c *controller) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	HandlerFunc(c.handler).ServeHTTP(w, req)
 }
 
 func (c *controller) refreshRoleTokens(ctx context.Context, entry configEntry, mfa string) error {
@@ -273,8 +283,10 @@ func (c *controller) refreshRoleTokens(ctx context.Context, entry configEntry, m
 		return errors.Wrap(err, "sts.AssumeRole")
 	}
 
+	newTokens := newTokens(entry.Region, out.Credentials)
+	newTokens.LastUse = tokens.LastUse
 	c.Lock()
-	c.roleTokens[entry.Name] = newTokens(entry.Region, out.Credentials)
+	c.roleTokens[entry.Name] = newTokens
 	c.Unlock()
 
 	if debugMode {
@@ -302,20 +314,32 @@ func (c *controller) step() {
 	c.RUnlock()
 
 	for role, tokens := range roleTokens {
+		// If the token was not used for more than 24h, drop it.
+		if time.Since(tokens.LastUse) >= 24*time.Hour {
+			log.Printf("%s not used for 24h, dropping it.", role)
+			log.Printf("Last use was %s.", tokens.LastUse.In(time.Local))
+			c.Lock()
+			delete(c.roleTokens, role)
+			c.Unlock()
+			continue
+		}
 		// If the token expires within 10 minutes, refresh it.
 		if !tokens.Expiration.Add(-10 * time.Minute).Before(time.Now()) {
 			continue
 		}
+		c.RLock()
+		entry := c.configRegistry[role]
+		c.RUnlock()
 		go func(entry configEntry) {
-			log.Printf("Refresh %q", entry.Name)
+			log.Printf("Refresh %q - %s.", entry.Name, entry.RoleARN)
 			if err := c.refreshRoleTokens(context.Background(), entry, ""); err != nil {
 				// In case of error, remove the tokens from the role. Next request for it will require mfa.
-				log.Printf("Error refreshing token for %q: %s", entry.Name, err)
+				log.Printf("Error refreshing token for %q: %s.", entry.Name, err)
 				c.Lock()
 				delete(c.roleTokens, entry.Name)
 				c.Unlock()
 			}
-		}(c.configRegistry[role])
+		}(entry)
 	}
 }
 
@@ -339,11 +363,13 @@ func (c *controller) Close() error {
 }
 
 type tokens struct {
-	Region          string
-	AccessKeyID     string
-	SecretAccessKey string
-	SessionToken    string
-	Expiration      time.Time
+	Version         int       `json:"Version"` // Always "1".
+	Region          string    `json:"Region"`
+	AccessKeyID     string    `json:"AccessKeyId"`
+	SecretAccessKey string    `json:"SecretAccessKey"`
+	SessionToken    string    `json:"SessionToken"`
+	Expiration      time.Time `json:"Expiraiton"`
+	LastUse         time.Time `json:"LastUse"`
 }
 
 func newTokens(region string, creds *sts.Credentials) tokens {
@@ -352,6 +378,7 @@ func newTokens(region string, creds *sts.Credentials) tokens {
 		return out
 	}
 	out.Region = region
+	out.Version = 1
 	if creds.AccessKeyId != nil {
 		out.AccessKeyID = *creds.AccessKeyId
 	}
@@ -367,10 +394,50 @@ func newTokens(region string, creds *sts.Credentials) tokens {
 	return out
 }
 
+func (c *controller) healthcheck(w http.ResponseWriter, req *http.Request) {
+	_ = req.ParseForm()
+
+	type roleToken struct {
+		Name       string
+		Region     string
+		Expiraiton time.Time
+		LastUse    time.Time
+	}
+	roleTokens := make([]roleToken, 0, len(c.roleTokens))
+	c.RLock()
+	for name, tokens := range c.roleTokens {
+		roleTokens = append(roleTokens, roleToken{
+			Name:       name,
+			Region:     tokens.Region,
+			Expiraiton: tokens.Expiration,
+			LastUse:    tokens.LastUse,
+		})
+	}
+	reg := make(configRegistry, len(c.configRegistry))
+	for k, v := range c.configRegistry {
+		reg[k] = v
+	}
+	c.RUnlock()
+
+	out := map[string]interface{}{
+		"role_tokens": roleTokens,
+	}
+	if req.Form.Get("config") != "" {
+		out["config_registry"] = reg
+	}
+
+	buf, _ := json.MarshalIndent(out, "", "  ")
+	_, _ = fmt.Fprintf(w, "%s\n", buf)
+}
+
 func server() {
-	config, credentials, err := loadAWSConfigFile("", "")
+	configPath, credsPath, err := defaultConfigPaths()
 	if err != nil {
-		log.Fatalf("Load aws conifg file: %s", err)
+		log.Fatalf("Lookup default aws files: %s.", err)
+	}
+	config, credentials, err := loadAWSConfigFile(configPath, credsPath)
+	if err != nil {
+		log.Fatalf("Load aws config files: %s.", err)
 	}
 
 	c := &controller{
@@ -379,26 +446,91 @@ func server() {
 		stopChan:       make(chan struct{}),
 	}
 
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatalf("Error starting fsnotify watcher: %s.", err)
+	}
+	if err := watcher.Add(configPath); err != nil {
+		log.Fatalf("Error adding the config file to the fsnotify watcher: %s.", err)
+	}
+	if err := watcher.Add(credsPath); err != nil {
+		log.Fatalf("Error adding the creds file to the fsnotify watcher: %s.", err)
+	}
+	go func() {
+	loop:
+		select {
+		case <-watcher.Events:
+			config, credentials, err := loadAWSConfigFile(configPath, credsPath)
+			if err != nil {
+				log.Fatalf("Load aws config files: %s.", err)
+			}
+			c.Lock()
+			c.configRegistry = processAWSConfig(config, credentials)
+			c.Unlock()
+		case <-c.stopChan:
+			return
+		}
+		goto loop
+	}()
+
 	if debugMode {
 		buf, _ := ioutil.ReadFile("/tmp/tt")
 		_ = json.Unmarshal(buf, &c.roleTokens)
 	}
 
 	go c.run()
-	if err := http.ListenAndServe(":9099", c); err != nil && err != http.ErrServerClosed {
+	http.Handle("/", HandlerFunc(c.handler))
+	http.HandleFunc("/healthcheck", c.healthcheck)
+	if err := http.ListenAndServe(":9099", nil); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("ListenAndServe: %s", err)
 	}
+}
+
+func lookupParentProcessProfile() string {
+	// TODO: Add support for osx.
+	if runtime.GOOS != "linux" {
+		log.Printf("Not linux.")
+		return ""
+	}
+	parentCmdLine, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/cmdline", os.Getppid()))
+	if err != nil {
+		panic(err)
+	}
+	parts := bytes.Split(parentCmdLine, []byte{0})
+	var profile string
+	for i, elem := range parts {
+		if string(elem) != "--profile" || i >= len(parts)-1 {
+			continue
+		}
+		profile = string(parts[i+1])
+		break
+	}
+	return profile
+}
+
+func lookupProfile() string {
+	profile := flag.Arg(0)
+	if profile == "" {
+		profile = lookupParentProcessProfile()
+	}
+	if profile == "" {
+		profile = os.Getenv("AWS_PROFILE")
+	}
+	if profile == "" {
+		profile = os.Getenv("AWS_DEFAULT_PROFILE")
+	}
+	return profile
 }
 
 func client() {
 	client := &http.Client{}
 	var mfa string
-	if len(os.Args) < 2 || os.Args[1] == "" {
+	profile := lookupProfile()
+	if profile == "" {
 		log.Fatalf("Usage: %s <env>", os.Args[0])
 	}
-	env := os.Args[1]
 begin:
-	req, err := http.NewRequest(http.MethodGet, "http://localhost:9099?env="+env+"&mfa="+mfa, nil)
+	req, err := http.NewRequest(http.MethodGet, "http://localhost:9099?fmt="+fmtMode+"&profile="+profile+"&mfa="+mfa, nil)
 	if err != nil {
 		log.Fatalf("NewRequest: %s", err)
 	}
@@ -411,24 +543,27 @@ begin:
 	e1 := resp.Body.Close()
 	_ = e1 // Best effort.
 	if resp.StatusCode == http.StatusInternalServerError && string(buf) == ErrMissingMFA.Error() {
-		fmt.Fprintf(os.Stderr, "Enter MFA code: ")
+		_, _ = fmt.Fprintf(os.Stderr, "[%s] %s.\n", profile, resp.Header.Get("X-Role-Arn"))
+		_, _ = fmt.Fprintf(os.Stderr, "Enter MFA code for %s: ", resp.Header.Get("X-Mfa-Arn"))
 		if _, err := fmt.Scanf("%s", &mfa); err != nil {
 			log.Fatalf("Read mfa: %s", err)
 		}
 		goto begin
 	}
-	fmt.Printf("%s", buf)
 	if resp.StatusCode != http.StatusOK {
-		os.Exit(1)
+		log.Fatalf("Error getting credentials for %q: %s\n", profile, buf)
 	}
+	fmt.Printf("%s", buf)
 }
 
 var debugMode bool
+var fmtMode string
 
 func main() {
 	var serverMode bool
 	flag.BoolVar(&serverMode, "d", false, "Serve mode.")
 	flag.BoolVar(&debugMode, "D", false, "Debug mode.")
+	flag.StringVar(&fmtMode, "f", "json", "Output format in client mode. 'json' or 'env'.")
 	flag.Parse()
 	if serverMode {
 		server()
