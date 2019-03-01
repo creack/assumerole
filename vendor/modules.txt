@@ -28,9 +28,13 @@ github.com/aws/aws-sdk-go/private/protocol/query/queryutil
 github.com/aws/aws-sdk-go/private/protocol/xml/xmlutil
 github.com/aws/aws-sdk-go/internal/sdkuri
 github.com/aws/aws-sdk-go/private/protocol
+# github.com/fsnotify/fsnotify v1.4.7
+github.com/fsnotify/fsnotify
 # github.com/go-ini/ini v1.42.0
 github.com/go-ini/ini
 # github.com/jmespath/go-jmespath v0.0.0-20180206201540-c2b33e8439af
 github.com/jmespath/go-jmespath
 # github.com/pkg/errors v0.8.1
 github.com/pkg/errors
+# golang.org/x/sys v0.0.0-20190228124157-a34e9553db1e
+golang.org/x/sys/unix
