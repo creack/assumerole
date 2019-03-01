@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/user"
 	"runtime"
 	"strings"
@@ -486,11 +487,27 @@ func server() {
 	}
 }
 
+func lookupParentProcessProfileDarwin() string {
+	// TODO: FInd the proper way to use the sysctl syscall to get the parent's commandline.
+	cmd := exec.Command("ps", "-p", fmt.Sprintf("%d", os.Getppid()), "-o", "command")
+	buf, _ := cmd.Output() // Best effort.
+	parts := strings.Split(string(buf), " ")
+	var profile string
+	for i, elem := range parts {
+		if string(elem) != "--profile" || i >= len(parts)-1 {
+			continue
+		}
+		profile = string(parts[i+1])
+		break
+	}
+	log.Printf(">>> %s", profile)
+	return profile
+}
+
 func lookupParentProcessProfile() string {
 	// TODO: Add support for osx.
 	if runtime.GOOS != "linux" {
-		log.Printf("Not linux.")
-		return ""
+		return lookupParentProcessProfileDarwin()
 	}
 	parentCmdLine, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/cmdline", os.Getppid()))
 	if err != nil {

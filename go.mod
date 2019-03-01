@@ -3,7 +3,7 @@ module github.com/creack/assumerole
 go 1.12
 
 require (
-	github.com/aws/aws-sdk-go v1.17.7
+	github.com/aws/aws-sdk-go v1.17.8
 	github.com/fsnotify/fsnotify v1.4.7
 	github.com/go-ini/ini v1.42.0
 	github.com/pkg/errors v0.8.1
