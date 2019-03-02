@@ -9,13 +9,19 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
+	"path"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -63,12 +69,9 @@ func (c configEntry) merge(c1 configEntry) configEntry {
 	return c
 }
 
-func defaultConfigPaths() (configFilePath, credsFilePath string, err error) {
-	u, err := user.Current() // Lookup current user to get HomeDir.
-	if err != nil {
-		return "", "", errors.Wrap(err, "user.Current")
-	}
-	return u.HomeDir + "/.aws/config", u.HomeDir + "/.aws/credentials", nil
+func defaultConfigPaths() (configFilePath, credsFilePath string) {
+	homeDir := guessHomedir()
+	return homeDir + "/.aws/config", homeDir + "/.aws/credentials"
 }
 
 func loadAWSConfigFile(configPath, credentialsPath string) (config, credentials *ini.File, err error) {
@@ -148,20 +151,24 @@ func (h HandlerFunc) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 type controller struct {
-	configRegistry
+	*http.Server
 
 	sync.RWMutex
-	roleTokens map[string]tokens
-	stopChan   chan struct{}
+	configRegistry configRegistry
+	roleTokens     map[string]tokens
+
+	stopChan chan struct{}
+	stopped  *uint32
 }
 
 func dumpTokens(w io.Writer, fmtMode string, tokens tokens) {
 	if fmtMode == "env" {
-		_, _ = fmt.Fprintf(w, "export AWS_DEFAULT_REGION=%q\n", tokens.Region)
+		_, _ = fmt.Fprintf(w, "export AWS_REGION=%q\n", tokens.Region)
 		_, _ = fmt.Fprintf(w, "export AWS_ACCESS_KEY_ID=%q\n", tokens.AccessKeyID)
 		_, _ = fmt.Fprintf(w, "export AWS_SECRET_ACCESS_KEY=%q\n", tokens.SecretAccessKey)
 		_, _ = fmt.Fprintf(w, "export AWS_SESSION_TOKEN=%q\n", tokens.SessionToken)
-		_, _ = fmt.Fprintf(w, "export AWS_SESSION_EXPIRATION=%q\n", tokens.Expiration.In(time.Local))
+		_, _ = fmt.Fprintf(w, "echo '[%s][%s] %s' >&2\n", tokens.Profile, tokens.Region, tokens.RoleARN)
+		_, _ = fmt.Fprintf(w, "echo 'Expires in: %s.' >&2\n", time.Until(tokens.Expiration).Truncate(time.Second))
 		return
 	}
 	buf, _ := json.MarshalIndent(tokens, "", "  ")
@@ -284,7 +291,7 @@ func (c *controller) refreshRoleTokens(ctx context.Context, entry configEntry, m
 		return errors.Wrap(err, "sts.AssumeRole")
 	}
 
-	newTokens := newTokens(entry.Region, out.Credentials)
+	newTokens := newTokens(entry, out.Credentials)
 	newTokens.LastUse = tokens.LastUse
 	c.Lock()
 	c.roleTokens[entry.Name] = newTokens
@@ -305,7 +312,7 @@ func (c *controller) refreshRoleTokens(ctx context.Context, entry configEntry, m
 	return nil
 }
 
-func (c *controller) step() {
+func (c *controller) step(force bool) {
 	// Copy the roleTokens map so we don't hold the lock.
 	c.RLock()
 	roleTokens := make(map[string]tokens, len(c.roleTokens))
@@ -324,8 +331,8 @@ func (c *controller) step() {
 			c.Unlock()
 			continue
 		}
-		// If the token expires within 10 minutes, refresh it.
-		if !tokens.Expiration.Add(-10 * time.Minute).Before(time.Now()) {
+		// If the token expires within 10 minutes or the force flag is set, refresh it.
+		if !force && !tokens.Expiration.Add(-10*time.Minute).Before(time.Now()) {
 			continue
 		}
 		c.RLock()
@@ -344,7 +351,24 @@ func (c *controller) step() {
 	}
 }
 
-func (c *controller) run() {
+func (c *controller) watchConfig(configPath, credsPath string, watcher *fsnotify.Watcher) {
+loop:
+	select {
+	case <-watcher.Events:
+		config, credentials, err := loadAWSConfigFile(configPath, credsPath)
+		if err != nil {
+			log.Fatalf("Load aws config files: %s.", err)
+		}
+		c.Lock()
+		c.configRegistry = processAWSConfig(config, credentials)
+		c.Unlock()
+	case <-c.stopChan:
+		return
+	}
+	goto loop
+}
+
+func (c *controller) refreshTokens() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
@@ -353,32 +377,49 @@ loop:
 	case <-c.stopChan:
 		return
 	case <-ticker.C:
-		go c.step()
+		go c.step(false)
 	}
 	goto loop
 }
 
 func (c *controller) Close() error {
+	if !atomic.CompareAndSwapUint32(c.stopped, 0, 1) {
+		return http.ErrServerClosed
+	}
+	if err := c.Server.Close(); err != nil {
+		return errors.Wrap(err, "http.Server.Close")
+	}
 	close(c.stopChan)
 	return nil
 }
 
-type tokens struct {
+// credentialProcessTokens is the epected output from the aws cli when using the credential_process option.
+type credentialProcessTokens struct {
 	Version         int       `json:"Version"` // Always "1".
-	Region          string    `json:"Region"`
 	AccessKeyID     string    `json:"AccessKeyId"`
 	SecretAccessKey string    `json:"SecretAccessKey"`
 	SessionToken    string    `json:"SessionToken"`
 	Expiration      time.Time `json:"Expiraiton"`
-	LastUse         time.Time `json:"LastUse"`
 }
 
-func newTokens(region string, creds *sts.Credentials) tokens {
+type tokens struct {
+	credentialProcessTokens
+
+	Profile string    `json:"Profile"`
+	RoleARN string    `json:"RoleARN"`
+	Region  string    `json:"Region"`
+	LastUse time.Time `json:"LastUse"`
+}
+
+func newTokens(entry configEntry, creds *sts.Credentials) tokens {
 	var out tokens
 	if creds == nil {
 		return out
 	}
-	out.Region = region
+	out.Region = entry.Region
+	out.Profile = entry.Name
+	out.RoleARN = entry.RoleARN
+
 	out.Version = 1
 	if creds.AccessKeyId != nil {
 		out.AccessKeyID = *creds.AccessKeyId
@@ -395,7 +436,16 @@ func newTokens(region string, creds *sts.Credentials) tokens {
 	return out
 }
 
-func (c *controller) healthcheck(w http.ResponseWriter, req *http.Request) {
+func (c *controller) killHandler(w http.ResponseWriter, req *http.Request) error {
+	return c.Close()
+}
+
+func (c *controller) refreshHandler(w http.ResponseWriter, req *http.Request) error {
+	c.step(true)
+	return nil
+}
+
+func (c *controller) healthcheckHandler(w http.ResponseWriter, req *http.Request) {
 	_ = req.ParseForm()
 
 	type roleToken struct {
@@ -431,64 +481,94 @@ func (c *controller) healthcheck(w http.ResponseWriter, req *http.Request) {
 	_, _ = fmt.Fprintf(w, "%s\n", buf)
 }
 
-func server() {
-	configPath, credsPath, err := defaultConfigPaths()
+// NewFSWatcher create a fsnotify watcher on the given paths.
+func NewFSWatcher(paths ...string) (*fsnotify.Watcher, error) {
+	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Fatalf("Lookup default aws files: %s.", err)
+		return nil, errors.Wrap(err, "NewWatcher")
 	}
+	for _, p := range paths {
+		if err := watcher.Add(p); err != nil {
+			return nil, errors.Wrapf(err, "add %q to watcher")
+		}
+	}
+	return watcher, nil
+}
+
+func (c *controller) stoppedMiddleware(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if atomic.LoadUint32(c.stopped) == 1 {
+			http.Error(w, http.ErrServerClosed.Error(), http.StatusGone)
+			return
+		}
+		h.ServeHTTP(w, req)
+	})
+}
+
+func server(network, addr string) {
+	configPath, credsPath := defaultConfigPaths()
+
 	config, credentials, err := loadAWSConfigFile(configPath, credsPath)
 	if err != nil {
 		log.Fatalf("Load aws config files: %s.", err)
 	}
 
 	c := &controller{
+		Server:         &http.Server{},
 		configRegistry: processAWSConfig(config, credentials),
 		roleTokens:     map[string]tokens{},
 		stopChan:       make(chan struct{}),
+		stopped:        new(uint32),
 	}
-
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatalf("Error starting fsnotify watcher: %s.", err)
-	}
-	if err := watcher.Add(configPath); err != nil {
-		log.Fatalf("Error adding the config file to the fsnotify watcher: %s.", err)
-	}
-	if err := watcher.Add(credsPath); err != nil {
-		log.Fatalf("Error adding the creds file to the fsnotify watcher: %s.", err)
-	}
-	go func() {
-	loop:
-		select {
-		case <-watcher.Events:
-			config, credentials, err := loadAWSConfigFile(configPath, credsPath)
-			if err != nil {
-				log.Fatalf("Load aws config files: %s.", err)
-			}
-			c.Lock()
-			c.configRegistry = processAWSConfig(config, credentials)
-			c.Unlock()
-		case <-c.stopChan:
-			return
-		}
-		goto loop
-	}()
-
 	if debugMode {
 		buf, _ := ioutil.ReadFile("/tmp/tt")
 		_ = json.Unmarshal(buf, &c.roleTokens)
 	}
 
-	go c.run()
-	http.Handle("/", HandlerFunc(c.handler))
-	http.HandleFunc("/healthcheck", c.healthcheck)
-	if err := http.ListenAndServe(":9099", nil); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("ListenAndServe: %s", err)
+	go c.refreshTokens()
+
+	watcher, err := NewFSWatcher(configPath, credsPath)
+	if err != nil {
+		log.Fatalf("Error creating new fsnotify watcher: %s", err)
 	}
+	go c.watchConfig(configPath, credsPath, watcher)
+
+	http.Handle("/", HandlerFunc(c.handler))
+	http.Handle("/refresh", HandlerFunc(c.refreshHandler))
+	http.Handle("/kill", HandlerFunc(c.killHandler))
+	http.HandleFunc("/healthcheck", c.healthcheckHandler)
+
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGSTOP)
+	go func() {
+		defer close(ch)
+		defer signal.Stop(ch)
+		defer signal.Reset(syscall.SIGINT, syscall.SIGTERM, syscall.SIGSTOP)
+		select {
+		case sig := <-ch:
+			log.Printf("Signal %q received, closing controller.", sig)
+			if err := c.Close(); err != nil {
+				log.Printf("Error closing controller after signal: %s.", err)
+			}
+		case <-c.stopChan:
+		}
+	}()
+
+	ln, err := net.Listen(network, addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Ready on %s %s.", network, addr)
+	if err := c.Serve(ln); err != nil && err != http.ErrServerClosed {
+		e1 := c.Close()
+		_ = e1 // Best effort, try to close before fatal so we have a chance to clear the socket.
+		log.Fatalf("Error Serving http: %s.", err)
+	}
+	log.Printf("Server closed.")
 }
 
 func lookupParentProcessProfileDarwin() string {
-	// TODO: FInd the proper way to use the sysctl syscall to get the parent's commandline.
+	// TODO: Find the proper way to use the sysctl syscall to get the parent's commandline.
 	cmd := exec.Command("ps", "-p", fmt.Sprintf("%d", os.Getppid()), "-o", "command")
 	buf, _ := cmd.Output() // Best effort.
 	parts := strings.Split(string(buf), " ")
@@ -500,7 +580,6 @@ func lookupParentProcessProfileDarwin() string {
 		profile = string(parts[i+1])
 		break
 	}
-	log.Printf(">>> %s", profile)
 	return profile
 }
 
@@ -539,15 +618,47 @@ func lookupProfile() string {
 	return profile
 }
 
-func client() {
-	client := &http.Client{}
+func parseAddr(in string) (u *url.URL, network, addr string, err error) {
+	u, err = url.Parse(in)
+	if err != nil {
+		return nil, "", "", errors.Wrap(err, "url.Parse")
+	}
+	if u.Scheme == "unix" {
+		network = u.Scheme
+		addr = path.Join(u.Host, u.Path)
+
+		u.Scheme = "http"
+		u.Host = network
+		u.Path = ""
+	} else {
+		network = "tcp"
+		addr = u.Host
+	}
+	return u, network, addr, nil
+}
+
+func newClient(network, addr string) (*http.Client, error) {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+					DualStack: true,
+				}).DialContext(ctx, network, addr)
+			},
+		},
+	}, nil
+}
+
+func client(client *http.Client, serverHost *url.URL) {
 	var mfa string
 	profile := lookupProfile()
 	if profile == "" {
 		log.Fatalf("Usage: %s <env>", os.Args[0])
 	}
 begin:
-	req, err := http.NewRequest(http.MethodGet, "http://localhost:9099?fmt="+fmtMode+"&profile="+profile+"&mfa="+mfa, nil)
+	req, err := http.NewRequest(http.MethodGet, serverHost.String()+"?fmt="+fmtMode+"&profile="+profile+"&mfa="+mfa, nil)
 	if err != nil {
 		log.Fatalf("NewRequest: %s", err)
 	}
@@ -573,18 +684,154 @@ begin:
 	fmt.Printf("%s", buf)
 }
 
+func waitServer(client *http.Client, serverHost *url.URL) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+loop:
+	req, err := http.NewRequest(http.MethodGet, serverHost.String()+"/healthcheck", nil)
+	if err != nil {
+		return errors.Wrap(err, "http.NewRequest")
+	}
+	req = req.WithContext(ctx)
+
+	resp, err := client.Do(req)
+	if err == nil {
+		e1 := resp.Body.Close()
+		_ = e1 // Ignore errors.
+	}
+	// If live, return.
+	if err == nil && resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	// Otherwise, give it some time and try again.
+	select {
+	case <-ctx.Done():
+		return errors.New("server took too long to start")
+	case <-ticker.C:
+		goto loop
+	}
+}
+
+// guessHomedir looks up the home dir for the user.
+// If "HOME" env is set, use it, otherwise, return current's user homedir.
+// Return empty string if not found/error.
+func guessHomedir() string {
+	if homeDir := os.Getenv("HOME"); homeDir != "" {
+		return homeDir
+	}
+	u, err := user.Current()
+	if err == nil {
+		return u.HomeDir
+	}
+	return ""
+}
+
 var debugMode bool
 var fmtMode string
 
 func main() {
-	var serverMode bool
+	var (
+		serverMode  bool
+		addrArg     string
+		logFile     string
+		quiet       bool
+		refreshMode bool
+		killMode    bool
+	)
+
+	homeDir := guessHomedir()
+
+	// TODO: Split flags in set for client/server.
 	flag.BoolVar(&serverMode, "d", false, "Serve mode.")
+	flag.StringVar(&addrArg, "addr", "unix://"+homeDir+"/.aws/.assume.sock", "Address to listen/dial. Support unix://<socket file> and [http://]<host>:<port>.")
 	flag.BoolVar(&debugMode, "D", false, "Debug mode.")
+	flag.BoolVar(&refreshMode, "refresh", false, "Refresh all cached tokens.")
+	flag.BoolVar(&killMode, "kill", false, "Kill the server.")
 	flag.StringVar(&fmtMode, "f", "json", "Output format in client mode. 'json' or 'env'.")
+	flag.StringVar(&logFile, "logfile", homeDir+"/.aws/.assume.logs", "Write logs to file.")
+	flag.BoolVar(&quiet, "q", false, "Toggle stderr logs.")
 	flag.Parse()
+
+	if serverMode && logFile != "" {
+		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			log.Fatalf("Error openning log file %q: %s.", logFile, err)
+		}
+		defer func() { e1 := f.Close(); _ = e1 }() // Best effort.
+		if !quiet {
+			log.SetOutput(io.MultiWriter(f, os.Stderr))
+		} else {
+			log.SetOutput(f)
+		}
+	}
+
+	u, network, addr, err := parseAddr(addrArg)
+	if err != nil {
+		log.Fatalf("parseAddr: %s.", err)
+	}
+
 	if serverMode {
-		server()
+		server(network, addr)
 		return
 	}
-	client()
+
+	c, err := newClient(network, addr)
+	if err != nil {
+		log.Fatalf("newClient: %s.", err)
+	}
+
+	// Start the server if needed.
+	// TODO: Add support for http mode.
+	if network == "unix" {
+		// TODO: Add a lockfile to avoid races.
+		if _, err := os.Stat(addr); err != nil {
+			fmt.Fprint(os.Stderr, "No server found. Starting it.\n")
+			cmd := exec.Command(os.Args[0], "-d",
+				fmt.Sprintf("-D=%t", debugMode),
+				"-addr", addrArg,
+				"-logfile", logFile,
+			)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // Detach the process.
+			if err := cmd.Start(); err != nil {
+				log.Fatalf("Error starting server: %s.", err)
+			}
+			// Wait for the process to be healthy.
+			if err := waitServer(c, u); err != nil {
+				log.Fatalf("Error waiting for server: %s.", err)
+			}
+		}
+	}
+
+	if !refreshMode && !killMode {
+		client(c, u)
+		return
+	}
+
+	var resp *http.Response
+	if refreshMode {
+		resp, err = c.Get(u.String() + "/refresh")
+	} else if killMode {
+		resp, err = c.Get(u.String() + "/kill")
+	} else {
+		log.Fatal("Unknown operation.")
+	}
+	if err != nil {
+		if killMode {
+			return
+		}
+		log.Fatalf("http.Get: %s.", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		buf, e1 := ioutil.ReadAll(resp.Body)
+		_ = e1 // Best effort.
+		e1 = resp.Body.Close()
+		_ = e1 // Best effort
+		log.Fatalf("Unexpected status: %d (%v)", resp.StatusCode, buf)
+	}
+	e1 := resp.Body.Close()
+	_ = e1 // Best effort.
 }
