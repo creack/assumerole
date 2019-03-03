@@ -577,7 +577,7 @@ func lookupParentProcessProfileDarwin() string {
 		if string(elem) != "--profile" || i >= len(parts)-1 {
 			continue
 		}
-		profile = string(parts[i+1])
+		profile = strings.TrimSpace(string(parts[i+1]))
 		break
 	}
 	return profile
