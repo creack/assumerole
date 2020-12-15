@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -30,7 +31,6 @@ import (
 	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/fsnotify/fsnotify"
 	"github.com/go-ini/ini"
-	"github.com/pkg/errors"
 )
 
 type configEntry struct {
@@ -74,21 +74,24 @@ func defaultConfigPaths() (configFilePath, credsFilePath string) {
 	return homeDir + "/.aws/config", homeDir + "/.aws/credentials"
 }
 
-func loadAWSConfigFile(configPath, credentialsPath string) (config, credentials *ini.File, err error) {
+func loadAWSConfigFile(configPath, credentialsPath string) (config, creds *ini.File, err error) {
 	// Load the ini files.
 	config, err = ini.Load(configPath)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "ini.Load config")
+		return nil, nil, fmt.Errorf("ini.Load config: %w", err)
 	}
-	credentials, err = ini.Load(credentialsPath)
+	creds, err = ini.Load(credentialsPath)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "ini.Load credentials")
+		return nil, nil, fmt.Errorf("ini.Load credentials: %w", err)
 	}
 
-	return config, credentials, nil
+	return config, creds, nil
 }
 
 func newIniConfigEntry(section *ini.Section) configEntry {
+	// If role_arn is set, use it, otherwise, try the non-standard _role_arn.
+	// NOTE: Using non-standard key as the cli will not call the credential_process if it has the role_arn key.
+	//       If the user has the standard key anyway and the cli fell back to the credential_process, respect it.
 	roleARN := section.Key("role_arn").String()
 	if roleARN == "" {
 		roleARN = section.Key("_role_arn").String()
@@ -140,11 +143,13 @@ func processAWSConfig(configFile, credentialsFile *ini.File) configRegistry {
 	return reg
 }
 
-// HandlerFunc .
+// HandlerFunc extends the base http handler with an error return.
 type HandlerFunc func(w http.ResponseWriter, req *http.Request) error
 
+// ServeHTTP handles the extended handler, dealing with the error.
 func (h HandlerFunc) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if err := h(w, req); err != nil {
+		// Everything is a 500.
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = fmt.Fprintf(w, "%s", err)
 	}
@@ -155,14 +160,16 @@ type controller struct {
 
 	sync.RWMutex
 	configRegistry configRegistry
-	roleTokens     map[string]tokens
+	roleTokens     map[string]localTokens
 
 	stopChan chan struct{}
 	stopped  *uint32
 }
 
-func dumpTokens(w io.Writer, fmtMode string, tokens tokens) {
-	if fmtMode == "env" {
+// dumpTokens dumps the generated token to the given writer.
+func dumpTokens(w io.Writer, fmtMode string, tokens localTokens) {
+	switch fmtMode {
+	case "env":
 		_, _ = fmt.Fprintf(w, "export AWS_REGION=%q\n", tokens.Region)
 		_, _ = fmt.Fprintf(w, "export AWS_ACCESS_KEY_ID=%q\n", tokens.AccessKeyID)
 		_, _ = fmt.Fprintf(w, "export AWS_SECRET_ACCESS_KEY=%q\n", tokens.SecretAccessKey)
@@ -170,9 +177,11 @@ func dumpTokens(w io.Writer, fmtMode string, tokens tokens) {
 		_, _ = fmt.Fprintf(w, "echo '[%s][%s] %s' >&2\n", tokens.Profile, tokens.Region, tokens.RoleARN)
 		_, _ = fmt.Fprintf(w, "echo 'Expires in: %s.' >&2\n", time.Until(tokens.Expiration).Truncate(time.Second))
 		return
+
+	default:
+		buf, _ := json.MarshalIndent(tokens, "", "  ")
+		_, _ = fmt.Fprintf(w, "%s\n", buf)
 	}
-	buf, _ := json.MarshalIndent(tokens, "", "  ")
-	_, _ = fmt.Fprintf(w, "%s\n", buf)
 }
 
 // Common errors.
@@ -182,7 +191,7 @@ var (
 
 func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 	if err := req.ParseForm(); err != nil {
-		return errors.Wrap(err, "ParseForm")
+		return fmt.Errorf("ParseForm: %w", err)
 	}
 	profile := req.Form.Get("profile")
 	if profile == "" {
@@ -202,6 +211,7 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 	}
 	c.Unlock()
 	if ok && tokens.Expiration.After(time.Now()) { // Also make sure that the tokens are not expired.
+		// We already have tokens and they are still valid. Dump them and stop here.
 		dumpTokens(w, fmtMode, tokens)
 		return nil
 	}
@@ -225,7 +235,7 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 	}
 
 	if err := c.refreshRoleTokens(req.Context(), entry, mfa); err != nil {
-		return errors.Wrap(err, "refreshRoleToken")
+		return fmt.Errorf("refreshRoleToken: %w", err)
 	}
 
 	c.Lock()
@@ -238,6 +248,7 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 	return nil
 }
 
+//nolint:gocognit // TODO: Refactor and split in smaller chunks.
 func (c *controller) refreshRoleTokens(ctx context.Context, entry configEntry, mfa string) error {
 	if entry.RoleARN == "" {
 		return errors.New("missing role_arn from config")
@@ -280,7 +291,7 @@ func (c *controller) refreshRoleTokens(ctx context.Context, entry configEntry, m
 
 	awsSession, err := session.NewSession(awsCfg)
 	if err != nil {
-		return errors.Wrap(err, "aws NewSession")
+		return fmt.Errorf("aws NewSession: %w", err)
 	}
 
 	stsService := sts.New(awsSession)
@@ -288,7 +299,7 @@ func (c *controller) refreshRoleTokens(ctx context.Context, entry configEntry, m
 	log.Printf("Calling sts.AssumeRole.")
 	out, err := stsService.AssumeRoleWithContext(ctx, &in)
 	if err != nil {
-		return errors.Wrap(err, "sts.AssumeRole")
+		return fmt.Errorf("sts.AssumeRole: %w", err)
 	}
 
 	newTokens := newTokens(entry, out.Credentials)
@@ -302,10 +313,11 @@ func (c *controller) refreshRoleTokens(ctx context.Context, entry configEntry, m
 		buf, err := json.Marshal(c.roleTokens)
 		c.RUnlock()
 		if err != nil {
-			return errors.Wrap(err, "marshal roletokens")
+			return fmt.Errorf("marshal roletokens: %w", err)
 		}
+		//nolint:gosec // Expected const name temp file, used for debugging.
 		if err := ioutil.WriteFile("/tmp/tt", buf, 0600); err != nil {
-			return errors.Wrap(err, "writefile")
+			return fmt.Errorf("writefile: %w", err)
 		}
 	}
 
@@ -315,7 +327,7 @@ func (c *controller) refreshRoleTokens(ctx context.Context, entry configEntry, m
 func (c *controller) step(force bool) {
 	// Copy the roleTokens map so we don't hold the lock.
 	c.RLock()
-	roleTokens := make(map[string]tokens, len(c.roleTokens))
+	roleTokens := make(map[string]localTokens, len(c.roleTokens))
 	for role, tokens := range c.roleTokens {
 		roleTokens[role] = tokens
 	}
@@ -355,12 +367,12 @@ func (c *controller) watchConfig(configPath, credsPath string, watcher *fsnotify
 loop:
 	select {
 	case <-watcher.Events:
-		config, credentials, err := loadAWSConfigFile(configPath, credsPath)
+		config, creds, err := loadAWSConfigFile(configPath, credsPath)
 		if err != nil {
 			log.Fatalf("Load aws config files: %s.", err)
 		}
 		c.Lock()
-		c.configRegistry = processAWSConfig(config, credentials)
+		c.configRegistry = processAWSConfig(config, creds)
 		c.Unlock()
 	case <-c.stopChan:
 		return
@@ -387,7 +399,7 @@ func (c *controller) Close() error {
 		return http.ErrServerClosed
 	}
 	if err := c.Server.Close(); err != nil {
-		return errors.Wrap(err, "http.Server.Close")
+		return fmt.Errorf("http.Server.Close: %w", err)
 	}
 	close(c.stopChan)
 	return nil
@@ -402,7 +414,8 @@ type credentialProcessTokens struct {
 	Expiration      time.Time `json:"Expiraiton"`
 }
 
-type tokens struct {
+// localTokens is the local representation of the AWS tokens.
+type localTokens struct {
 	credentialProcessTokens
 
 	Profile string    `json:"Profile"`
@@ -411,8 +424,8 @@ type tokens struct {
 	LastUse time.Time `json:"LastUse"`
 }
 
-func newTokens(entry configEntry, creds *sts.Credentials) tokens {
-	var out tokens
+func newTokens(entry configEntry, creds *sts.Credentials) localTokens {
+	var out localTokens
 	if creds == nil {
 		return out
 	}
@@ -485,11 +498,11 @@ func (c *controller) healthcheckHandler(w http.ResponseWriter, req *http.Request
 func NewFSWatcher(paths ...string) (*fsnotify.Watcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		return nil, errors.Wrap(err, "NewWatcher")
+		return nil, fmt.Errorf("NewWatcher: %w", err)
 	}
 	for _, p := range paths {
 		if err := watcher.Add(p); err != nil {
-			return nil, errors.Wrapf(err, "add %q to watcher")
+			return nil, fmt.Errorf("add %q to watcher: %w", p, err)
 		}
 	}
 	return watcher, nil
@@ -508,15 +521,19 @@ func (c *controller) stoppedMiddleware(h http.Handler) http.Handler {
 func server(network, addr string) {
 	configPath, credsPath := defaultConfigPaths()
 
-	config, credentials, err := loadAWSConfigFile(configPath, credsPath)
+	config, creds, err := loadAWSConfigFile(configPath, credsPath)
 	if err != nil {
 		log.Fatalf("Load aws config files: %s.", err)
 	}
 
+	// TODO: Doing this while dev to make sure I didn't forget a handler. Remove it.
+	http.DefaultServeMux = nil
+
+	mux := http.NewServeMux()
 	c := &controller{
 		Server:         &http.Server{},
-		configRegistry: processAWSConfig(config, credentials),
-		roleTokens:     map[string]tokens{},
+		configRegistry: processAWSConfig(config, creds),
+		roleTokens:     map[string]localTokens{},
 		stopChan:       make(chan struct{}),
 		stopped:        new(uint32),
 	}
@@ -533,17 +550,19 @@ func server(network, addr string) {
 	}
 	go c.watchConfig(configPath, credsPath, watcher)
 
-	http.Handle("/", HandlerFunc(c.handler))
-	http.Handle("/refresh", HandlerFunc(c.refreshHandler))
-	http.Handle("/kill", HandlerFunc(c.killHandler))
-	http.HandleFunc("/healthcheck", c.healthcheckHandler)
+	mux.Handle("/", HandlerFunc(c.handler))
+	mux.Handle("/refresh", HandlerFunc(c.refreshHandler))
+	mux.Handle("/kill", HandlerFunc(c.killHandler))
+	mux.HandleFunc("/healthcheck", c.healthcheckHandler)
+
+	c.Server.Handler = c.stoppedMiddleware(mux)
 
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGSTOP)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
 		defer close(ch)
 		defer signal.Stop(ch)
-		defer signal.Reset(syscall.SIGINT, syscall.SIGTERM, syscall.SIGSTOP)
+		defer signal.Reset(syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 		select {
 		case sig := <-ch:
 			log.Printf("Signal %q received, closing controller.", sig)
@@ -569,22 +588,22 @@ func server(network, addr string) {
 
 func lookupParentProcessProfileDarwin() string {
 	// TODO: Find the proper way to use the sysctl syscall to get the parent's commandline.
+	//nolint:gosec // The only variable passed to exec is the formatted getppid int, which is safe.
 	cmd := exec.Command("ps", "-p", fmt.Sprintf("%d", os.Getppid()), "-o", "command")
 	buf, _ := cmd.Output() // Best effort.
 	parts := strings.Split(string(buf), " ")
 	var profile string
 	for i, elem := range parts {
-		if string(elem) != "--profile" || i >= len(parts)-1 {
+		if elem != "--profile" || i >= len(parts)-1 {
 			continue
 		}
-		profile = strings.TrimSpace(string(parts[i+1]))
+		profile = strings.TrimSpace(parts[i+1])
 		break
 	}
 	return profile
 }
 
 func lookupParentProcessProfile() string {
-	// TODO: Add support for osx.
 	if runtime.GOOS != "linux" {
 		return lookupParentProcessProfileDarwin()
 	}
@@ -621,7 +640,7 @@ func lookupProfile() string {
 func parseAddr(in string) (u *url.URL, network, addr string, err error) {
 	u, err = url.Parse(in)
 	if err != nil {
-		return nil, "", "", errors.Wrap(err, "url.Parse")
+		return nil, "", "", fmt.Errorf("url.Parse: %w", err)
 	}
 	if u.Scheme == "unix" {
 		network = u.Scheme
@@ -637,7 +656,8 @@ func parseAddr(in string) (u *url.URL, network, addr string, err error) {
 	return u, network, addr, nil
 }
 
-func newClient(network, addr string) (*http.Client, error) {
+// Create a new HTTP Client. Needed in order to support unix domain sockets.
+func newHTTPClient(network, addr string) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -648,10 +668,10 @@ func newClient(network, addr string) (*http.Client, error) {
 				}).DialContext(ctx, network, addr)
 			},
 		},
-	}, nil
+	}
 }
 
-func client(client *http.Client, serverHost *url.URL) {
+func client(ctx context.Context, client *http.Client, serverHost *url.URL, fmtMode string) {
 	var mfa string
 	profile := lookupProfile()
 	if profile == "" {
@@ -662,19 +682,20 @@ begin:
 	if err != nil {
 		log.Fatalf("NewRequest: %s", err)
 	}
+	req = req.WithContext(ctx)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Fatalf("Do: %s", err)
+		log.Fatalf("http.client.Do: %s", err)
 	}
 	buf, err := ioutil.ReadAll(resp.Body)
-	e1 := resp.Body.Close()
-	_ = e1 // Best effort.
+	_ = resp.Body.Close() // Best effort.
+	_ = err               // Best effort.
 	if resp.StatusCode == http.StatusInternalServerError && string(buf) == ErrMissingMFA.Error() {
 		_, _ = fmt.Fprintf(os.Stderr, "[%s] %s.\n", profile, resp.Header.Get("X-Role-Arn"))
 		_, _ = fmt.Fprintf(os.Stderr, "Enter MFA code for %s: ", resp.Header.Get("X-Mfa-Arn"))
 		if _, err := fmt.Scanf("%s", &mfa); err != nil {
-			log.Fatalf("Read mfa: %s", err)
+			log.Fatalf("Read MFA: %s", err)
 		}
 		goto begin
 	}
@@ -694,7 +715,7 @@ func waitServer(client *http.Client, serverHost *url.URL) error {
 loop:
 	req, err := http.NewRequest(http.MethodGet, serverHost.String()+"/healthcheck", nil)
 	if err != nil {
-		return errors.Wrap(err, "http.NewRequest")
+		return fmt.Errorf("http.NewRequest: %w", err)
 	}
 	req = req.WithContext(ctx)
 
@@ -730,10 +751,13 @@ func guessHomedir() string {
 	return ""
 }
 
+//nolint:gochecknoglobals // TODO: Scope this.
 var debugMode bool
-var fmtMode string
 
+//nolint:gocognit,gocyclo // TODO: Refactor and split in smaller chunks.
 func main() {
+	ctx := context.Background()
+
 	var (
 		serverMode  bool
 		addrArg     string
@@ -741,6 +765,7 @@ func main() {
 		quiet       bool
 		refreshMode bool
 		killMode    bool
+		fmtMode     string
 	)
 
 	homeDir := guessHomedir()
@@ -757,11 +782,12 @@ func main() {
 	flag.Parse()
 
 	if serverMode && logFile != "" {
-		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		//nolint:gosec // Expect variable filename. We are not in a lib and this is directly controlled by the user. We can safely ignore gosec here.
+		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if err != nil {
 			log.Fatalf("Error openning log file %q: %s.", logFile, err)
 		}
-		defer func() { e1 := f.Close(); _ = e1 }() // Best effort.
+		defer func() { _ = f.Close() }() // Best effort.
 		if !quiet {
 			log.SetOutput(io.MultiWriter(f, os.Stderr))
 		} else {
@@ -771,6 +797,7 @@ func main() {
 
 	u, network, addr, err := parseAddr(addrArg)
 	if err != nil {
+		//nolint:gocritic // Here, we can safely Fatal without worrying about closing the logger.
 		log.Fatalf("parseAddr: %s.", err)
 	}
 
@@ -779,17 +806,15 @@ func main() {
 		return
 	}
 
-	c, err := newClient(network, addr)
-	if err != nil {
-		log.Fatalf("newClient: %s.", err)
-	}
+	httpClient := newHTTPClient(network, addr)
 
 	// Start the server if needed.
-	// TODO: Add support for http mode.
+	//nolint:nestif // TODO: Refactor.
 	if network == "unix" {
 		// TODO: Add a lockfile to avoid races.
 		if _, err := os.Stat(addr); err != nil {
 			fmt.Fprint(os.Stderr, "No server found. Starting it.\n")
+			//nolint:gosec // We are not a library, and we are executing ourself. Can safely ignore gosec here.
 			cmd := exec.Command(os.Args[0], "-d",
 				fmt.Sprintf("-D=%t", debugMode),
 				"-addr", addrArg,
@@ -800,38 +825,42 @@ func main() {
 				log.Fatalf("Error starting server: %s.", err)
 			}
 			// Wait for the process to be healthy.
-			if err := waitServer(c, u); err != nil {
+			if err := waitServer(httpClient, u); err != nil {
 				log.Fatalf("Error waiting for server: %s.", err)
 			}
 		}
 	}
 
 	if !refreshMode && !killMode {
-		client(c, u)
+		client(ctx, httpClient, u, fmtMode)
 		return
 	}
 
 	var resp *http.Response
-	if refreshMode {
-		resp, err = c.Get(u.String() + "/refresh")
-	} else if killMode {
-		resp, err = c.Get(u.String() + "/kill")
-	} else {
+	switch {
+	case refreshMode:
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u.String()+"/refresh", nil) // Can't fail. URL already validated.
+		//nolint:bodyclose // False positive. Body closed outside the switch.
+		resp, err = httpClient.Do(req)
+	case killMode:
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u.String()+"/kill", nil) // Can't fail. URL already validated.
+		//nolint:bodyclose // False positive. Body closed outside the switch.
+		resp, err = httpClient.Do(req)
+	default: // Unreachable.
 		log.Fatal("Unknown operation.")
 	}
 	if err != nil {
-		if killMode {
+		if killMode { // In Kill mode, if we have an error, just ignore it and quit.
+			_ = resp.Body.Close() // Best effort.
 			return
 		}
 		log.Fatalf("http.Get: %s.", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		buf, e1 := ioutil.ReadAll(resp.Body)
-		_ = e1 // Best effort.
-		e1 = resp.Body.Close()
-		_ = e1 // Best effort
+		_ = e1                // Best effort.
+		_ = resp.Body.Close() // Best effort.
 		log.Fatalf("Unexpected status: %d (%v)", resp.StatusCode, buf)
 	}
-	e1 := resp.Body.Close()
-	_ = e1 // Best effort.
+	_ = resp.Body.Close() // Best effort.
 }
