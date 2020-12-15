@@ -164,6 +164,8 @@ type controller struct {
 
 	stopChan chan struct{}
 	stopped  *uint32
+
+	debugMode bool
 }
 
 // dumpTokens dumps the generated token to the given writer.
@@ -179,7 +181,7 @@ func dumpTokens(w io.Writer, fmtMode string, tokens localTokens) {
 		return
 
 	default:
-		buf, _ := json.MarshalIndent(tokens, "", "  ")
+		buf, _ := json.MarshalIndent(tokens, "", "  ") // Can't fail. We own the struct and it is can be safely encoded to json.
 		_, _ = fmt.Fprintf(w, "%s\n", buf)
 	}
 }
@@ -248,6 +250,7 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 	c.roleTokens[profile] = tokens
 	c.Unlock()
 
+	w.WriteHeader(http.StatusOK)
 	dumpTokens(w, fmtMode, tokens)
 	return nil
 }
@@ -312,9 +315,9 @@ func (c *controller) refreshRoleTokens(ctx context.Context, entry configEntry, m
 	c.roleTokens[entry.Name] = newTokens
 	c.Unlock()
 
-	if debugMode {
+	if c.debugMode {
 		c.RLock()
-		buf, err := json.Marshal(c.roleTokens)
+		buf, err := json.MarshalIndent(c.roleTokens, "", "  ")
 		c.RUnlock()
 		if err != nil {
 			return fmt.Errorf("marshal roletokens: %w", err)
@@ -415,7 +418,7 @@ type credentialProcessTokens struct {
 	AccessKeyID     string    `json:"AccessKeyId"`
 	SecretAccessKey string    `json:"SecretAccessKey"`
 	SessionToken    string    `json:"SessionToken"`
-	Expiration      time.Time `json:"Expiraiton"`
+	Expiration      time.Time `json:"Expiration"`
 }
 
 // localTokens is the local representation of the AWS tokens.
@@ -437,7 +440,7 @@ func newTokens(entry configEntry, creds *sts.Credentials) localTokens {
 	out.Profile = entry.Name
 	out.RoleARN = entry.RoleARN
 
-	out.Version = 1
+	out.Version = 1 // Always 1.
 	if creds.AccessKeyId != nil {
 		out.AccessKeyID = *creds.AccessKeyId
 	}
@@ -522,16 +525,13 @@ func (c *controller) stoppedMiddleware(h http.Handler) http.Handler {
 	})
 }
 
-func server(network, addr string) {
+func server(network, addr string, debugMode bool) {
 	configPath, credsPath := defaultConfigPaths()
 
 	config, creds, err := loadAWSConfigFile(configPath, credsPath)
 	if err != nil {
 		log.Fatalf("Load aws config files: %s.", err)
 	}
-
-	// TODO: Doing this while dev to make sure I didn't forget a handler. Remove it.
-	http.DefaultServeMux = nil
 
 	mux := http.NewServeMux()
 	c := &controller{
@@ -540,6 +540,7 @@ func server(network, addr string) {
 		roleTokens:     map[string]localTokens{},
 		stopChan:       make(chan struct{}),
 		stopped:        new(uint32),
+		debugMode:      debugMode,
 	}
 	if debugMode {
 		buf, _ := ioutil.ReadFile("/tmp/tt")
@@ -590,8 +591,9 @@ func server(network, addr string) {
 	log.Printf("Server closed.")
 }
 
+// On Darwin, use the `ps` tool to lookup the parent process command line.
+// TODO: Find the proper way to use the sysctl syscall to get the parent's commandline.
 func lookupParentProcessProfileDarwin() string {
-	// TODO: Find the proper way to use the sysctl syscall to get the parent's commandline.
 	//nolint:gosec // The only variable passed to exec is the formatted getppid int, which is safe.
 	cmd := exec.Command("ps", "-p", fmt.Sprintf("%d", os.Getppid()), "-o", "command")
 	buf, _ := cmd.Output() // Best effort.
@@ -607,10 +609,8 @@ func lookupParentProcessProfileDarwin() string {
 	return profile
 }
 
-func lookupParentProcessProfile() string {
-	if runtime.GOOS != "linux" {
-		return lookupParentProcessProfileDarwin()
-	}
+// On Linux, lookup the parent command line from /proc.
+func lookupParentProcessProfileLinux() string {
 	parentCmdLine, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/cmdline", os.Getppid()))
 	if err != nil {
 		panic(err)
@@ -627,17 +627,40 @@ func lookupParentProcessProfile() string {
 	return profile
 }
 
+// lookupParentProcessProfile checks if the aws cli has been called with `--profile` which would take precedence over the config file.
+// Has the CLI doesn't expose this to the credentials_process (a.k.a. us), we need to do some os-specific wizardry to support it.
+func lookupParentProcessProfile() string {
+	switch strings.ToLower(runtime.GOOS) {
+	case "linux":
+		return lookupParentProcessProfileLinux()
+	case "darwin":
+		return lookupParentProcessProfileDarwin()
+	default:
+		log.Printf("WARNING: Unsupported OS: %q. If the CLI with called with --profile, it will be ignored. Please use AWS_PROFILE environment variable instead if needed.", runtime.GOOS)
+		return ""
+	}
+}
+
 func lookupProfile() string {
+	// Default with the first command lint argument.
 	profile := flag.Arg(0)
+
+	// If missing, lookup the profile set in the parent process (i.e. if the user called the cli with --profile).
 	if profile == "" {
 		profile = lookupParentProcessProfile()
 	}
+
+	// If missing, check the AWS_PROFILE.
 	if profile == "" {
 		profile = os.Getenv("AWS_PROFILE")
 	}
+
+	// If missing, check AWS_DEFAULT_PROFILE.
 	if profile == "" {
 		profile = os.Getenv("AWS_DEFAULT_PROFILE")
 	}
+
+	// If missing, let the caller decide what to do.
 	return profile
 }
 
@@ -677,16 +700,17 @@ func newHTTPClient(network, addr string) *http.Client {
 
 func client(ctx context.Context, client *http.Client, serverHost *url.URL, fmtMode string) {
 	var mfa string
+
+	// Lookup which profile we need to use.
 	profile := lookupProfile()
 	if profile == "" {
-		log.Fatalf("Usage: %s <env>", os.Args[0])
+		log.Fatalf("Usage: %s <profile>", os.Args[0])
 	}
 begin:
-	req, err := http.NewRequest(http.MethodGet, serverHost.String()+"?fmt="+fmtMode+"&profile="+profile+"&mfa="+mfa, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverHost.String()+"?fmt="+fmtMode+"&profile="+profile+"&mfa="+mfa, nil)
 	if err != nil {
 		log.Fatalf("NewRequest: %s", err)
 	}
-	req = req.WithContext(ctx)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -695,7 +719,10 @@ begin:
 	buf, err := ioutil.ReadAll(resp.Body)
 	_ = resp.Body.Close() // Best effort.
 	_ = err               // Best effort.
+
+	// If the request failed because of a Missing MFA, prompt the user to enter the code and try again.
 	if resp.StatusCode == http.StatusInternalServerError && string(buf) == errMissingMFA.Error() {
+		// TODO: To workaround botocore not surfacing stderr to the user (https://github.com/boto/botocore/pull/1349), try to directly write to the TTY.
 		_, _ = fmt.Fprintf(os.Stderr, "[%s] %s.\n", profile, resp.Header.Get("X-Role-Arn"))
 		_, _ = fmt.Fprintf(os.Stderr, "Enter MFA code for %s: ", resp.Header.Get("X-Mfa-Arn"))
 		if _, err := fmt.Scanf("%s", &mfa); err != nil {
@@ -703,14 +730,17 @@ begin:
 		}
 		goto begin
 	}
+	// If the request is not a success, fatal.
 	if resp.StatusCode != http.StatusOK {
 		log.Fatalf("Error getting credentials for %q: %s\n", profile, buf)
 	}
-	fmt.Printf("%s", buf)
+
+	// Print the result to stdout, this is what the AWS CLI and the shell will read.
+	fmt.Fprintf(os.Stdout, "%s", buf)
 }
 
-func waitServer(client *http.Client, serverHost *url.URL) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+func waitServer(ctx context.Context, client *http.Client, serverHost *url.URL) error {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
 	ticker := time.NewTicker(500 * time.Millisecond)
@@ -755,9 +785,6 @@ func guessHomedir() string {
 	return ""
 }
 
-//nolint:gochecknoglobals // TODO: Scope this.
-var debugMode bool
-
 //nolint:gocognit,gocyclo // TODO: Refactor and split in smaller chunks.
 func main() {
 	ctx := context.Background()
@@ -770,6 +797,7 @@ func main() {
 		refreshMode bool
 		killMode    bool
 		fmtMode     string
+		debugMode   bool
 	)
 
 	homeDir := guessHomedir()
@@ -806,7 +834,7 @@ func main() {
 	}
 
 	if serverMode {
-		server(network, addr)
+		server(network, addr, debugMode)
 		return
 	}
 
@@ -829,7 +857,7 @@ func main() {
 				log.Fatalf("Error starting server: %s.", err)
 			}
 			// Wait for the process to be healthy.
-			if err := waitServer(httpClient, u); err != nil {
+			if err := waitServer(ctx, httpClient, u); err != nil {
 				log.Fatalf("Error waiting for server: %s.", err)
 			}
 		}

@@ -9,7 +9,7 @@ To get the message to display, apply this patch: https://github.com/boto/botocor
 
 # Example config.
 
-NOTE: This tool expects the non-standard `_role_arn` as the CLI will not call the credential_process if it finds the role_`arn_key`.
+NOTE: This tool expects the non-standard `_role_arn` as the CLI will not call the credential_process if it finds the `role_arn` key.
 
 ```ini
 # file: ~/.aws/config
