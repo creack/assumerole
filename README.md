@@ -7,6 +7,8 @@ Assume AWS role and auto refresh tokens.
 Botocore doesn't display stderr, so in case the MFA is needed, the aws cli will not display the message, but still expect an input.
 To get the message to display, apply this patch: https://github.com/boto/botocore/pull/1349/files
 
+Unfortunately, the patch doesn't work with aws-cli v2 which embed a pre-compiled version of botocore.
+
 # Example config.
 
 NOTE: This tool expects the non-standard `_role_arn` as the CLI will not call the credential_process if it finds the `role_arn` key.

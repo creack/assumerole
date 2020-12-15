@@ -143,11 +143,11 @@ func processAWSConfig(configFile, credentialsFile *ini.File) configRegistry {
 	return reg
 }
 
-// HandlerFunc extends the base http handler with an error return.
-type HandlerFunc func(w http.ResponseWriter, req *http.Request) error
+// handlerFunc extends the base http handler with an error return.
+type handlerFunc func(w http.ResponseWriter, req *http.Request) error
 
 // ServeHTTP handles the extended handler, dealing with the error.
-func (h HandlerFunc) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+func (h handlerFunc) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if err := h(w, req); err != nil {
 		// Everything is a 500.
 		w.WriteHeader(http.StatusInternalServerError)
@@ -164,8 +164,6 @@ type controller struct {
 
 	stopChan chan struct{}
 	stopped  *uint32
-
-	debugMode bool
 }
 
 // dumpTokens dumps the generated token to the given writer.
@@ -191,7 +189,6 @@ var (
 	errMissingMFA           = errors.New("missing mfa")
 	errMissingQueryString   = errors.New("missing 'profile' query string")
 	errMissingProfileConfig = errors.New("no configuration found for requested profile")
-	errMissingRoleARN       = errors.New("no role_arn found")
 	errServerStartTimeout   = errors.New("server took too long to start")
 )
 
@@ -208,7 +205,7 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 		fmtMode = "env"
 	}
 
-	// Check if we have already valid tokens for the requested env.
+	// Check if we have already valid tokens for the requested profile.
 	c.Lock()
 	tokens, ok := c.roleTokens[profile]
 	if ok {
@@ -228,9 +225,6 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 	c.RUnlock()
 	if !ok {
 		return errMissingProfileConfig
-	}
-	if entry.RoleARN == "" {
-		return errMissingRoleARN
 	}
 
 	mfa := req.Form.Get("mfa")
@@ -255,10 +249,64 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 	return nil
 }
 
+func (c *controller) iamUser(ctx context.Context, entry configEntry, mfa string) error {
+	// When the target is a user, the MFA is required, we can't auto-refresh.
+	// Without it, AWS will likely succeed but the resulting token will be useless.
+	if entry.MFASerial == "" || mfa == "" {
+		// If we still have a valid token, keep it as is.
+		c.RLock()
+		tokens, ok := c.roleTokens[entry.Name]
+		c.RUnlock()
+
+		if ok && tokens.Expiration.Before(time.Now()) {
+			return nil
+		}
+
+		// Otherwise, error out. This will result in the server clearing the tokens and the CLI to prompt for a new MFA code.
+		log.Printf("IAM User tokens can't be fetched without MFA.")
+		return errMissingMFA
+	}
+
+	in := sts.GetSessionTokenInput{
+		DurationSeconds: aws.Int64(3600),
+		SerialNumber:    &entry.MFASerial,
+		TokenCode:       &mfa,
+	}
+
+	awsCfg := aws.NewConfig()
+	if entry.Region != "" {
+		awsCfg = awsCfg.WithRegion(entry.Region)
+	}
+
+	creds := credentials.NewStaticCredentials(entry.AccessKeyID, entry.SecretAccessKey, "")
+	awsCfg = awsCfg.WithCredentials(creds)
+
+	awsSession, err := session.NewSession(awsCfg)
+	if err != nil {
+		return fmt.Errorf("aws NewSession: %w", err)
+	}
+
+	stsService := sts.New(awsSession)
+
+	log.Printf("Calling sts.GetSessionToken.")
+	out, err := stsService.GetSessionTokenWithContext(ctx, &in)
+	if err != nil {
+		return fmt.Errorf("sts.GetSessionToken: %w", err)
+	}
+
+	newTokens := newTokens(entry, out.Credentials)
+	c.Lock()
+	c.roleTokens[entry.Name] = newTokens
+	c.Unlock()
+
+	return nil
+}
+
 //nolint:gocognit // TODO: Refactor and split in smaller chunks.
 func (c *controller) refreshRoleTokens(ctx context.Context, entry configEntry, mfa string) error {
 	if entry.RoleARN == "" {
-		return errMissingRoleARN
+		// If we don't have a role ARN, use the IAM user from the source profile instead.
+		return c.iamUser(ctx, entry, mfa)
 	}
 
 	sessionName := entry.SourceProfile
@@ -315,19 +363,6 @@ func (c *controller) refreshRoleTokens(ctx context.Context, entry configEntry, m
 	c.roleTokens[entry.Name] = newTokens
 	c.Unlock()
 
-	if c.debugMode {
-		c.RLock()
-		buf, err := json.MarshalIndent(c.roleTokens, "", "  ")
-		c.RUnlock()
-		if err != nil {
-			return fmt.Errorf("marshal roletokens: %w", err)
-		}
-		//nolint:gosec // Expected const name temp file, used for debugging.
-		if err := ioutil.WriteFile("/tmp/tt", buf, 0600); err != nil {
-			return fmt.Errorf("writefile: %w", err)
-		}
-	}
-
 	return nil
 }
 
@@ -358,7 +393,8 @@ func (c *controller) step(force bool) {
 		entry := c.configRegistry[role]
 		c.RUnlock()
 		go func(entry configEntry) {
-			log.Printf("Refresh %q - %s.", entry.Name, entry.RoleARN)
+			log.Printf("Refreshing %q - %q.", entry.Name, entry.RoleARN)
+			// NOTE: This is a background job, expected use of context.Background().
 			if err := c.refreshRoleTokens(context.Background(), entry, ""); err != nil {
 				// In case of error, remove the tokens from the role. Next request for it will require mfa.
 				log.Printf("Error refreshing token for %q: %s.", entry.Name, err)
@@ -525,7 +561,7 @@ func (c *controller) stoppedMiddleware(h http.Handler) http.Handler {
 	})
 }
 
-func server(network, addr string, debugMode bool) {
+func server(network, addr string) {
 	configPath, credsPath := defaultConfigPaths()
 
 	config, creds, err := loadAWSConfigFile(configPath, credsPath)
@@ -540,11 +576,6 @@ func server(network, addr string, debugMode bool) {
 		roleTokens:     map[string]localTokens{},
 		stopChan:       make(chan struct{}),
 		stopped:        new(uint32),
-		debugMode:      debugMode,
-	}
-	if debugMode {
-		buf, _ := ioutil.ReadFile("/tmp/tt")
-		_ = json.Unmarshal(buf, &c.roleTokens)
 	}
 
 	go c.refreshTokens()
@@ -555,9 +586,9 @@ func server(network, addr string, debugMode bool) {
 	}
 	go c.watchConfig(configPath, credsPath, watcher)
 
-	mux.Handle("/", HandlerFunc(c.handler))
-	mux.Handle("/refresh", HandlerFunc(c.refreshHandler))
-	mux.Handle("/kill", HandlerFunc(c.killHandler))
+	mux.Handle("/", handlerFunc(c.handler))
+	mux.Handle("/refresh", handlerFunc(c.refreshHandler))
+	mux.Handle("/kill", handlerFunc(c.killHandler))
 	mux.HandleFunc("/healthcheck", c.healthcheckHandler)
 
 	c.Server.Handler = c.stoppedMiddleware(mux)
@@ -580,13 +611,14 @@ func server(network, addr string, debugMode bool) {
 
 	ln, err := net.Listen(network, addr)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("net.Listen: %s.", err)
 	}
-	log.Printf("Ready on %s %s.", network, addr)
-	if err := c.Serve(ln); err != nil && errors.Is(err, http.ErrServerClosed) {
-		e1 := c.Close()
-		_ = e1 // Best effort, try to close before fatal so we have a chance to clear the socket.
-		log.Fatalf("Error Serving http: %s.", err)
+	log.Printf("Ready on %q %s.", network, addr)
+	if err := c.Serve(ln); err != nil {
+		_ = c.Close()                              // Best effort, try to close before fatal so we have a chance to clear the socket.
+		if !errors.Is(err, http.ErrServerClosed) { // Unless it is the expect "ServerClosed" error, fatal.
+			log.Fatalf("Error Serving http: %s.", err)
+		}
 	}
 	log.Printf("Server closed.")
 }
@@ -621,14 +653,14 @@ func lookupParentProcessProfileLinux() string {
 		if string(elem) != "--profile" || i >= len(parts)-1 {
 			continue
 		}
-		profile = string(parts[i+1])
+		profile = strings.TrimSpace(string(parts[i+1]))
 		break
 	}
 	return profile
 }
 
-// lookupParentProcessProfile checks if the aws cli has been called with `--profile` which would take precedence over the config file.
-// Has the CLI doesn't expose this to the credentials_process (a.k.a. us), we need to do some os-specific wizardry to support it.
+// lookupParentProcessProfile checks if the AWS CLI has been called with `--profile` which would take precedence over the config file.
+// Has the CLI doesn't expose this to the credentials_process (a.k.a. us), we need to do some OS-specific wizardry to support it.
 func lookupParentProcessProfile() string {
 	switch strings.ToLower(runtime.GOOS) {
 	case "linux":
@@ -636,7 +668,10 @@ func lookupParentProcessProfile() string {
 	case "darwin":
 		return lookupParentProcessProfileDarwin()
 	default:
-		log.Printf("WARNING: Unsupported OS: %q. If the CLI with called with --profile, it will be ignored. Please use AWS_PROFILE environment variable instead if needed.", runtime.GOOS)
+		if os.Getenv("SILENCE_ASSUMEROLE_OS_WARNING") != "1" { // Allow a potential freebsd user to silence the warning.
+			log.Printf("WARNING: Unsupported OS: %q. If the CLI with called with --profile, it will be ignored.", runtime.GOOS)
+			log.Print("Please use AWS_PROFILE environment variable instead if needed.")
+		}
 		return ""
 	}
 }
@@ -645,7 +680,7 @@ func lookupProfile() string {
 	// Default with the first command lint argument.
 	profile := flag.Arg(0)
 
-	// If missing, lookup the profile set in the parent process (i.e. if the user called the cli with --profile).
+	// If missing, lookup the profile set in the parent process (i.e. if the user called the CLI with --profile).
 	if profile == "" {
 		profile = lookupParentProcessProfile()
 	}
@@ -683,7 +718,7 @@ func parseAddr(in string) (u *url.URL, network, addr string, err error) {
 	return u, network, addr, nil
 }
 
-// Create a new HTTP Client. Needed in order to support unix domain sockets.
+// Create a new HTTP Client. Needed in order to support Unix Domain sockets.
 func newHTTPClient(network, addr string) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
@@ -722,7 +757,6 @@ begin:
 
 	// If the request failed because of a Missing MFA, prompt the user to enter the code and try again.
 	if resp.StatusCode == http.StatusInternalServerError && string(buf) == errMissingMFA.Error() {
-		// TODO: To workaround botocore not surfacing stderr to the user (https://github.com/boto/botocore/pull/1349), try to directly write to the TTY.
 		_, _ = fmt.Fprintf(os.Stderr, "[%s] %s.\n", profile, resp.Header.Get("X-Role-Arn"))
 		_, _ = fmt.Fprintf(os.Stderr, "Enter MFA code for %s: ", resp.Header.Get("X-Mfa-Arn"))
 		if _, err := fmt.Scanf("%s", &mfa); err != nil {
@@ -773,7 +807,7 @@ loop:
 
 // guessHomedir looks up the home dir for the user.
 // If "HOME" env is set, use it, otherwise, return current's user homedir.
-// Return empty string if not found/error.
+// Returns empty string if not found/error.
 func guessHomedir() string {
 	if homeDir := os.Getenv("HOME"); homeDir != "" {
 		return homeDir
@@ -797,7 +831,6 @@ func main() {
 		refreshMode bool
 		killMode    bool
 		fmtMode     string
-		debugMode   bool
 	)
 
 	homeDir := guessHomedir()
@@ -805,7 +838,6 @@ func main() {
 	// TODO: Split flags in set for client/server.
 	flag.BoolVar(&serverMode, "d", false, "Serve mode.")
 	flag.StringVar(&addrArg, "addr", "unix://"+homeDir+"/.aws/.assume.sock", "Address to listen/dial. Support unix://<socket file> and [http://]<host>:<port>.")
-	flag.BoolVar(&debugMode, "D", false, "Debug mode.")
 	flag.BoolVar(&refreshMode, "refresh", false, "Refresh all cached tokens.")
 	flag.BoolVar(&killMode, "kill", false, "Kill the server.")
 	flag.StringVar(&fmtMode, "f", "json", "Output format in client mode. 'json' or 'env'.")
@@ -834,7 +866,7 @@ func main() {
 	}
 
 	if serverMode {
-		server(network, addr, debugMode)
+		server(network, addr)
 		return
 	}
 
@@ -842,13 +874,12 @@ func main() {
 
 	// Start the server if needed.
 	//nolint:nestif // TODO: Refactor.
-	if network == "unix" {
+	if network == "unix" && !killMode {
 		// TODO: Add a lockfile to avoid races.
 		if _, err := os.Stat(addr); err != nil {
 			fmt.Fprint(os.Stderr, "No server found. Starting it.\n")
-			//nolint:gosec // We are not a library, and we are executing ourself. Can safely ignore gosec here.
+			//nolint:gosec // We are not a library and we are executing ourself. Can safely ignore gosec here.
 			cmd := exec.Command(os.Args[0], "-d",
-				fmt.Sprintf("-D=%t", debugMode),
 				"-addr", addrArg,
 				"-logfile", logFile,
 			)
@@ -882,8 +913,7 @@ func main() {
 		log.Fatal("Unknown operation.")
 	}
 	if err != nil {
-		if killMode { // In Kill mode, if we have an error, just ignore it and quit.
-			_ = resp.Body.Close() // Best effort.
+		if killMode { // In Kill mode, if we have an error, just ignore it, we the server is already stopped.
 			return
 		}
 		log.Fatalf("http.Get: %s.", err)
