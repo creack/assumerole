@@ -167,13 +167,13 @@ type controller struct {
 }
 
 // dumpTokens dumps the generated token to the given writer.
-func dumpTokens(w io.Writer, fmtMode string, tokens localTokens) {
+func dumpTokens(w io.Writer, fmtMode, envPrefix string, tokens localTokens) {
 	switch fmtMode {
 	case "env":
-		_, _ = fmt.Fprintf(w, "export AWS_REGION=%q\n", tokens.Region)
-		_, _ = fmt.Fprintf(w, "export AWS_ACCESS_KEY_ID=%q\n", tokens.AccessKeyID)
-		_, _ = fmt.Fprintf(w, "export AWS_SECRET_ACCESS_KEY=%q\n", tokens.SecretAccessKey)
-		_, _ = fmt.Fprintf(w, "export AWS_SESSION_TOKEN=%q\n", tokens.SessionToken)
+		_, _ = fmt.Fprintf(w, "export %sAWS_REGION=%q\n", envPrefix, tokens.Region)
+		_, _ = fmt.Fprintf(w, "export %sAWS_ACCESS_KEY_ID=%q\n", envPrefix, tokens.AccessKeyID)
+		_, _ = fmt.Fprintf(w, "export %sAWS_SECRET_ACCESS_KEY=%q\n", envPrefix, tokens.SecretAccessKey)
+		_, _ = fmt.Fprintf(w, "export %sAWS_SESSION_TOKEN=%q\n", envPrefix, tokens.SessionToken)
 		_, _ = fmt.Fprintf(w, "echo '[%s][%s] %s' >&2\n", tokens.Profile, tokens.Region, tokens.RoleARN)
 		_, _ = fmt.Fprintf(w, "echo 'Expires in: %s.' >&2\n", time.Until(tokens.Expiration).Truncate(time.Second))
 		return
@@ -204,6 +204,7 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 	if fmtMode == "" {
 		fmtMode = "env"
 	}
+	envPrefix := req.Form.Get("prefix") // If missing, will be empty string.
 
 	// Check if we have already valid tokens for the requested profile.
 	c.Lock()
@@ -215,7 +216,7 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 	c.Unlock()
 	if ok && tokens.Expiration.After(time.Now()) { // Also make sure that the tokens are not expired.
 		// We already have tokens and they are still valid. Dump them and stop here.
-		dumpTokens(w, fmtMode, tokens)
+		dumpTokens(w, fmtMode, envPrefix, tokens)
 		return nil
 	}
 
@@ -245,7 +246,7 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 	c.Unlock()
 
 	w.WriteHeader(http.StatusOK)
-	dumpTokens(w, fmtMode, tokens)
+	dumpTokens(w, fmtMode, envPrefix, tokens)
 	return nil
 }
 
@@ -377,7 +378,7 @@ func (c *controller) step(force bool) {
 
 	for role, tokens := range roleTokens {
 		// If the token was not used for more than 24h, drop it.
-		if time.Since(tokens.LastUse) >= 24*time.Hour {
+		if time.Since(tokens.LastUse) >= 24*14*time.Hour {
 			log.Printf("%s not used for 24h, dropping it.", role)
 			log.Printf("Last use was %s.", tokens.LastUse.In(time.Local))
 			c.Lock()
@@ -733,7 +734,7 @@ func newHTTPClient(network, addr string) *http.Client {
 	}
 }
 
-func client(ctx context.Context, client *http.Client, serverHost *url.URL, fmtMode string) {
+func client(ctx context.Context, client *http.Client, serverHost *url.URL, fmtMode, envPrefix string) {
 	var mfa string
 
 	// Lookup which profile we need to use.
@@ -742,7 +743,13 @@ func client(ctx context.Context, client *http.Client, serverHost *url.URL, fmtMo
 		log.Fatalf("Usage: %s <profile>", os.Args[0])
 	}
 begin:
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverHost.String()+"?fmt="+fmtMode+"&profile="+profile+"&mfa="+mfa, nil)
+	qs := url.Values{}
+	qs.Add("fmt", fmtMode)
+	qs.Add("prefix", envPrefix)
+	qs.Add("profile", profile)
+	qs.Add("mfa", mfa)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverHost.String()+"?"+qs.Encode(), nil)
 	if err != nil {
 		log.Fatalf("NewRequest: %s", err)
 	}
@@ -831,6 +838,7 @@ func main() {
 		refreshMode bool
 		killMode    bool
 		fmtMode     string
+		envPrefix   string
 	)
 
 	homeDir := guessHomedir()
@@ -841,6 +849,7 @@ func main() {
 	flag.BoolVar(&refreshMode, "refresh", false, "Refresh all cached tokens.")
 	flag.BoolVar(&killMode, "kill", false, "Kill the server.")
 	flag.StringVar(&fmtMode, "f", "json", "Output format in client mode. 'json' or 'env'.")
+	flag.StringVar(&envPrefix, "prefix", "", "When in 'env' format, add the given prefix  to all exported variables. Useful to quickly set TF_VAR_xxx.")
 	flag.StringVar(&logFile, "logfile", homeDir+"/.aws/.assume.logs", "Write logs to file.")
 	flag.BoolVar(&quiet, "q", false, "Toggle stderr logs.")
 	flag.Parse()
@@ -895,7 +904,7 @@ func main() {
 	}
 
 	if !refreshMode && !killMode {
-		client(ctx, httpClient, u, fmtMode)
+		client(ctx, httpClient, u, fmtMode, envPrefix)
 		return
 	}
 
