@@ -23,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -177,8 +178,17 @@ func dumpTokens(w io.Writer, fmtMode, envPrefix string, tokens localTokens) {
 		_, _ = fmt.Fprintf(w, "echo '[%s][%s] %s' >&2\n", tokens.Profile, tokens.Region, tokens.RoleARN)
 		_, _ = fmt.Fprintf(w, "echo 'Expires in: %s.' >&2\n", time.Until(tokens.Expiration).Truncate(time.Second))
 		return
-
-	default:
+	case "shared_file":
+		tw := tabwriter.NewWriter(w, 2, 2, 1, ' ', 0)
+		_, _ = fmt.Fprintf(tw, "# Role: %q.\n", tokens.RoleARN)
+		_, _ = fmt.Fprintf(tw, "# Expires at: %s.\n", tokens.Expiration.Local())
+		_, _ = fmt.Fprintf(tw, "[%s]\n", tokens.Profile)
+		_, _ = fmt.Fprintf(tw, "region\t=\t%s\n", tokens.Region)
+		_, _ = fmt.Fprintf(tw, "aws_access_key_id\t=\t%s\n", tokens.AccessKeyID)
+		_, _ = fmt.Fprintf(tw, "aws_secret_access_key\t=\t%s\n", tokens.SecretAccessKey)
+		_, _ = fmt.Fprintf(tw, "aws_session_token\t=\t%s\n", tokens.SessionToken)
+		_ = tw.Flush()
+	default: // Defaults to "json".
 		buf, _ := json.MarshalIndent(tokens, "", "  ") // Can't fail. We own the struct and it is can be safely encoded to json.
 		_, _ = fmt.Fprintf(w, "%s\n", buf)
 	}
@@ -848,7 +858,7 @@ func main() {
 	flag.StringVar(&addrArg, "addr", "unix://"+homeDir+"/.aws/.assume.sock", "Address to listen/dial. Support unix://<socket file> and [http://]<host>:<port>.")
 	flag.BoolVar(&refreshMode, "refresh", false, "Refresh all cached tokens.")
 	flag.BoolVar(&killMode, "kill", false, "Kill the server.")
-	flag.StringVar(&fmtMode, "f", "json", "Output format in client mode. 'json' or 'env'.")
+	flag.StringVar(&fmtMode, "f", "json", "Output format in client mode. 'json', 'env' or 'shared_file'.")
 	flag.StringVar(&envPrefix, "prefix", "", "When in 'env' format, add the given prefix  to all exported variables. Useful to quickly set TF_VAR_xxx.")
 	flag.StringVar(&logFile, "logfile", homeDir+"/.aws/.assume.logs", "Write logs to file.")
 	flag.BoolVar(&quiet, "q", false, "Toggle stderr logs.")
