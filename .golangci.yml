@@ -231,17 +231,19 @@ linters:
   # NOTE: enable-all is deprecated because too  many people don't pin versions...
   # We still require explicit documentation on why some linters are disabled.
   # disable:
-  #   - depguard # Go linter that checks if package imports are in a list of acceptable packages [fast: true, auto-fix: false]
-  #   - godox    # Tool for detection of FIXME, TODO and other comment keywords [fast: true, auto-fix: false]
-  #   - gomnd    # An analyzer to detect magic numbers. [fast: true, auto-fix: false]
-  #   - nlreturn # nlreturn checks for a new line before return and branch statements to increase code clarity [fast: true, auto-fix: false]
-  #   - wsl      # Whitespace Linter - Forces you to use empty lines! [fast: true, auto-fix: false]
+  #   - depguard         # Go linter that checks if package imports are in a list of acceptable packages [fast: true, auto-fix: false]
+  #   - exhaustivestruct # Checks if all struct's fields are initialized [fast: true, auto-fix: false]
+  #   - godox            # Tool for detection of FIXME, TODO and other comment keywords [fast: true, auto-fix: false]
+  #   - gomnd            # An analyzer to detect magic numbers. [fast: true, auto-fix: false]
+  #   - nlreturn         # nlreturn checks for a new line before return and branch statements to increase code clarity [fast: true, auto-fix: false]
+  #   - wsl              # Whitespace Linter - Forces you to use empty lines! [fast: true, auto-fix: false]
   # disable-reasons:
-  #   - depguard # Checks whitelisted/blacklisted import path, but runs way too slow. Not that useful.
-  #   - godox    # Don't fail when finding TODO, FIXME, etc.
-  #   - gomnd    # Checks for magic numbers. Disabled due to too many false positives not configurable (03/01/2020 v1.23.7).
-  #   - nlreturn # Actually reduces readability in most cases.
-  #   - wsl      # Forces to add newlines around blocks. Lots of false positives, not that useful.
+  #   - depguard         # Checks whitelisted/blacklisted import path, but runs way too slow. Not that useful.
+  #   - exhaustivestruct # Good concept, but not mature enough (errors on not assignable fields like locks) and too noisy when using AWS SDK as most fields are unused.
+  #   - godox            # Don't fail when finding TODO, FIXME, etc.
+  #   - gomnd            # Checks for magic numbers. Disabled due to too many false positives not configurable (03/01/2020 v1.23.7).
+  #   - nlreturn         # Actually reduces readability in most cases.
+  #   - wsl              # Forces to add newlines around blocks. Lots of false positives, not that useful.
   enable:
   - asciicheck       # Simple linter to check that your code does not contain non-ASCII identifiers [fast: true, auto-fix: false]
   - bodyclose        # checks whether HTTP response body is closed successfully [fast: true, auto-fix: false]
@@ -249,6 +251,7 @@ linters:
   - dogsled          # Checks assignments with too many blank identifiers (e.g. x, _, _, _, := f()) [fast: true, auto-fix: false]
   - dupl             # Tool for code clone detection [fast: true, auto-fix: false]
   - errcheck         # Errcheck is a program for checking for unchecked errors in go programs. These unchecked errors can be critical bugs in some cases [fast: true, auto-fix: false]
+  - errorlint        # go-errorlint is a source code linter for Go software that can be used to find code that will cause problemswith the error wrapping scheme introduced in Go 1.13. [fast: true, auto-fix: false]
   - exhaustive       # check exhaustiveness of enum switch statements [fast: true, auto-fix: false]
   - exportloopref    # checks for pointers to enclosing loop variables [fast: true, auto-fix: false]
   - funlen           # Tool for detection of long functions [fast: true, auto-fix: false]
@@ -280,6 +283,7 @@ linters:
   - nestif           # Reports deeply nested if statements [fast: true, auto-fix: false]
   - noctx            # noctx finds sending http request without context.Context [fast: true, auto-fix: false]
   - nolintlint       # Reports ill-formed or insufficient nolint directives [fast: true, auto-fix: false]
+  - paralleltest     # paralleltest detects missing usage of t.Parallel() method in your Go test [fast: true, auto-fix: false]
   - prealloc         # Finds slice declarations that could potentially be preallocated [fast: true, auto-fix: false]
   - rowserrcheck     # checks whether Err of rows is checked successfully [fast: true, auto-fix: false]
   - scopelint        # Scopelint checks for unpinned variables in go programs [fast: true, auto-fix: false]
@@ -288,12 +292,14 @@ linters:
   - structcheck      # Finds unused struct fields [fast: true, auto-fix: false]
   - stylecheck       # Stylecheck is a replacement for golint [fast: true, auto-fix: false]
   - testpackage      # linter that makes you use a separate _test package [fast: true, auto-fix: false]
+  - tparallel        # tparallel detects inappropriate usage of t.Parallel() method in your Go test codes [fast: true, auto-fix: false]
   - typecheck        # Like the front-end of a Go compiler, parses and type-checks Go code [fast: true, auto-fix: false]
   - unconvert        # Remove unnecessary type conversions [fast: true, auto-fix: false]
   - unparam          # Reports unused function parameters [fast: true, auto-fix: false]
   - unused           # Checks Go code for unused constants, variables, functions and types [fast: false, auto-fix: false]
   - varcheck         # Finds unused global variables and constants [fast: true, auto-fix: false]
   - whitespace       # Tool for detection of leading and trailing whitespace [fast: true, auto-fix: true]
+  - wrapcheck        # Checks that errors returned from external packages are wrapped [fast: true, auto-fix: false]
 
 issues:
   exclude:

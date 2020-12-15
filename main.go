@@ -186,7 +186,11 @@ func dumpTokens(w io.Writer, fmtMode string, tokens localTokens) {
 
 // Common errors.
 var (
-	ErrMissingMFA = errors.New("missing mfa")
+	errMissingMFA           = errors.New("missing mfa")
+	errMissingQueryString   = errors.New("missing 'profile' query string")
+	errMissingProfileConfig = errors.New("no configuration found for requested profile")
+	errMissingRoleARN       = errors.New("no role_arn found")
+	errServerStartTimeout   = errors.New("server took too long to start")
 )
 
 func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
@@ -195,7 +199,7 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 	}
 	profile := req.Form.Get("profile")
 	if profile == "" {
-		return errors.New("missing 'profile' query string")
+		return errMissingQueryString
 	}
 	fmtMode := req.Form.Get("fmt")
 	if fmtMode == "" {
@@ -221,17 +225,17 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 	entry, ok := c.configRegistry[profile]
 	c.RUnlock()
 	if !ok {
-		return errors.New("no configuration found for requested env")
+		return errMissingProfileConfig
 	}
 	if entry.RoleARN == "" {
-		return errors.New("no role_arn found for requested env")
+		return errMissingRoleARN
 	}
 
 	mfa := req.Form.Get("mfa")
 	if entry.MFASerial != "" && mfa == "" {
 		w.Header().Set("X-Role-Arn", entry.RoleARN)
 		w.Header().Set("X-Mfa-Arn", entry.MFASerial)
-		return ErrMissingMFA
+		return errMissingMFA
 	}
 
 	if err := c.refreshRoleTokens(req.Context(), entry, mfa); err != nil {
@@ -251,7 +255,7 @@ func (c *controller) handler(w http.ResponseWriter, req *http.Request) error {
 //nolint:gocognit // TODO: Refactor and split in smaller chunks.
 func (c *controller) refreshRoleTokens(ctx context.Context, entry configEntry, mfa string) error {
 	if entry.RoleARN == "" {
-		return errors.New("missing role_arn from config")
+		return errMissingRoleARN
 	}
 
 	sessionName := entry.SourceProfile
@@ -578,7 +582,7 @@ func server(network, addr string) {
 		log.Fatal(err)
 	}
 	log.Printf("Ready on %s %s.", network, addr)
-	if err := c.Serve(ln); err != nil && err != http.ErrServerClosed {
+	if err := c.Serve(ln); err != nil && errors.Is(err, http.ErrServerClosed) {
 		e1 := c.Close()
 		_ = e1 // Best effort, try to close before fatal so we have a chance to clear the socket.
 		log.Fatalf("Error Serving http: %s.", err)
@@ -691,7 +695,7 @@ begin:
 	buf, err := ioutil.ReadAll(resp.Body)
 	_ = resp.Body.Close() // Best effort.
 	_ = err               // Best effort.
-	if resp.StatusCode == http.StatusInternalServerError && string(buf) == ErrMissingMFA.Error() {
+	if resp.StatusCode == http.StatusInternalServerError && string(buf) == errMissingMFA.Error() {
 		_, _ = fmt.Fprintf(os.Stderr, "[%s] %s.\n", profile, resp.Header.Get("X-Role-Arn"))
 		_, _ = fmt.Fprintf(os.Stderr, "Enter MFA code for %s: ", resp.Header.Get("X-Mfa-Arn"))
 		if _, err := fmt.Scanf("%s", &mfa); err != nil {
@@ -731,7 +735,7 @@ loop:
 	// Otherwise, give it some time and try again.
 	select {
 	case <-ctx.Done():
-		return errors.New("server took too long to start")
+		return errServerStartTimeout
 	case <-ticker.C:
 		goto loop
 	}
