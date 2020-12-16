@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -620,6 +621,10 @@ func server(network, addr string) {
 		}
 	}()
 
+	if network == "unix" { // When using Unix Domain, make sure the target directory exists.
+		_ = os.MkdirAll(filepath.Dir(addr), 0700) // Best effort.
+	}
+
 	ln, err := net.Listen(network, addr)
 	if err != nil {
 		log.Fatalf("net.Listen: %s.", err)
@@ -863,16 +868,17 @@ func main() {
 
 	// TODO: Split flags in set for client/server.
 	flag.BoolVar(&serverMode, "d", false, "Serve mode.")
-	flag.StringVar(&addrArg, "addr", "unix://"+homeDir+"/.aws/.assume.sock", "Address to listen/dial. Support unix://<socket file> and [http://]<host>:<port>.")
+	flag.StringVar(&addrArg, "addr", "unix://"+homeDir+"/.aws/.assumerole/default", "Address to listen/dial. Support unix://<socket file> and [http://]<host>:<port>.")
 	flag.BoolVar(&refreshMode, "refresh", false, "Refresh all cached tokens.")
 	flag.BoolVar(&killMode, "kill", false, "Kill the server.")
 	flag.StringVar(&fmtMode, "f", defaultEnv("ASSUMEROLE_FMT", "json"), "Output format in client mode. 'json', 'env' or 'shared_file'.")
 	flag.StringVar(&envPrefix, "prefix", defaultEnv("ASSUMEROLE_PREFIX", ""), "When in 'env' format, add the given prefix  to all exported variables. Useful to quickly set TF_VAR_xxx.")
-	flag.StringVar(&logFile, "logfile", homeDir+"/.aws/.assume.logs", "Write logs to file.")
+	flag.StringVar(&logFile, "logfile", homeDir+"/.aws/.assumerole/logs", "Write logs to file.")
 	flag.BoolVar(&quiet, "q", false, "Toggle stderr logs.")
 	flag.Parse()
 
 	if serverMode && logFile != "" {
+		_ = os.MkdirAll(filepath.Dir(logFile), 0700) // Best effort.
 		//nolint:gosec // Expect variable filename. We are not in a lib and this is directly controlled by the user. We can safely ignore gosec here.
 		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if err != nil {

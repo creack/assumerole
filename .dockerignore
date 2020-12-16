@@ -1,0 +1,7 @@
+# Ignore everything.
+*
+# Explicitly enable what we need.
+!vendor
+!go.mod
+!go.sum
+!main.go
