@@ -269,7 +269,7 @@ func (c *controller) iamUser(ctx context.Context, entry configEntry, mfa string)
 		tokens, ok := c.roleTokens[entry.Name]
 		c.RUnlock()
 
-		if ok && tokens.Expiration.Before(time.Now()) {
+		if ok && tokens.Expiration.After(time.Now()) {
 			return nil
 		}
 
@@ -527,7 +527,7 @@ func (c *controller) healthcheckHandler(w http.ResponseWriter, req *http.Request
 		roleTokens = append(roleTokens, roleToken{
 			Name:       name,
 			Region:     tokens.Region,
-			Expiraiton: tokens.Expiration,
+			Expiraiton: tokens.Expiration.Local(),
 			LastUse:    tokens.LastUse,
 		})
 	}
@@ -549,7 +549,7 @@ func (c *controller) healthcheckHandler(w http.ResponseWriter, req *http.Request
 }
 
 // NewFSWatcher create a fsnotify watcher on the given paths.
-func NewFSWatcher(paths ...string) (*fsnotify.Watcher, error) {
+func newFSWatcher(paths ...string) (*fsnotify.Watcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, fmt.Errorf("NewWatcher: %w", err)
@@ -591,7 +591,7 @@ func server(network, addr string) {
 
 	go c.refreshTokens()
 
-	watcher, err := NewFSWatcher(configPath, credsPath)
+	watcher, err := newFSWatcher(configPath, credsPath)
 	if err != nil {
 		log.Fatalf("Error creating new fsnotify watcher: %s", err)
 	}
