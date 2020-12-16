@@ -836,6 +836,14 @@ func guessHomedir() string {
 	return ""
 }
 
+// defaultEnv looks for the given key in the env, if found, returns the value, otherwise, return the provided default.
+func defaultEnv(key, defaultValue string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return defaultValue
+}
+
 //nolint:gocognit,gocyclo // TODO: Refactor and split in smaller chunks.
 func main() {
 	ctx := context.Background()
@@ -858,8 +866,8 @@ func main() {
 	flag.StringVar(&addrArg, "addr", "unix://"+homeDir+"/.aws/.assume.sock", "Address to listen/dial. Support unix://<socket file> and [http://]<host>:<port>.")
 	flag.BoolVar(&refreshMode, "refresh", false, "Refresh all cached tokens.")
 	flag.BoolVar(&killMode, "kill", false, "Kill the server.")
-	flag.StringVar(&fmtMode, "f", "json", "Output format in client mode. 'json', 'env' or 'shared_file'.")
-	flag.StringVar(&envPrefix, "prefix", "", "When in 'env' format, add the given prefix  to all exported variables. Useful to quickly set TF_VAR_xxx.")
+	flag.StringVar(&fmtMode, "f", defaultEnv("ASSUMEROLE_FMT", "json"), "Output format in client mode. 'json', 'env' or 'shared_file'.")
+	flag.StringVar(&envPrefix, "prefix", defaultEnv("ASSUMEROLE_PREFIX", ""), "When in 'env' format, add the given prefix  to all exported variables. Useful to quickly set TF_VAR_xxx.")
 	flag.StringVar(&logFile, "logfile", homeDir+"/.aws/.assume.logs", "Write logs to file.")
 	flag.BoolVar(&quiet, "q", false, "Toggle stderr logs.")
 	flag.Parse()
