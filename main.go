@@ -621,8 +621,11 @@ func server(network, addr string) {
 		}
 	}()
 
-	if network == "unix" { // When using Unix Domain, make sure the target directory exists.
+	if network == "unix" {
+		// When using Unix Domain, make sure the target directory exists.
 		_ = os.MkdirAll(filepath.Dir(addr), 0700) // Best effort.
+		// And make sure there is no left-over socket.
+		_ = os.Remove(addr) // Best effort.
 	}
 
 	ln, err := net.Listen(network, addr)
